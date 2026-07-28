@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
@@ -108,16 +109,146 @@ def estimate_api_cost_no_cache_usd(u: dict) -> float:
 # Paths
 # ---------------------------------------------------------------------------
 
+def grok_home() -> Path:
+    home = os.environ.get("GROK_HOME", "").strip()
+    if home:
+        return Path(home)
+    return Path.home() / ".grok"
+
+
 def sessions_root() -> Path:
     env = os.environ.get("GROK_DATA_DIR", "").strip()
     if env:
         return Path(env)
-    home = os.environ.get("GROK_HOME", "").strip()
-    if home:
-        p = Path(home) / "sessions"
-        if p.is_dir():
-            return p
+    p = grok_home() / "sessions"
+    if p.is_dir():
+        return p
     return Path.home() / ".grok" / "sessions"
+
+
+# ---------------------------------------------------------------------------
+# Account quota (Weekly/Monthly limit from Grok CLI /usage)
+# ---------------------------------------------------------------------------
+# Grok CLI fetches account credits and logs:
+#   msg = "billing: fetched credits config"
+#   ctx.config.creditUsagePercent + currentPeriod.type WEEKLY|MONTHLY
+# This is the same source as the TUI `/usage` "Weekly limit: 24%" line.
+# Live HTTP endpoint is internal (`/billing?format=credits`); we read the
+# latest successful fetch from ~/.grok/logs/unified.jsonl (updated often
+# while the CLI runs).
+
+
+@dataclass
+class AccountLimit:
+    percent: Optional[float]
+    period_label: str  # Weekly / Monthly / Period
+    period_type: str
+    period_start: Optional[str]
+    period_end: Optional[str]
+    subscription: Optional[str]
+    fetched_at: Optional[str]
+    source: str = "log"
+
+    def headline(self) -> str:
+        if self.percent is None:
+            return f"{self.period_label} limit: n/a"
+        # Match Grok TUI: "Weekly limit: 24%"
+        pct = int(self.percent) if float(self.percent).is_integer() else self.percent
+        return f"{self.period_label} limit: {pct}%"
+
+    def as_public_dict(self) -> dict:
+        return {
+            "percent": self.percent,
+            "period_label": self.period_label,
+            "period_type": self.period_type,
+            "period_start": self.period_start,
+            "period_end": self.period_end,
+            "subscription": self.subscription,
+            "fetched_at": self.fetched_at,
+            "source": self.source,
+            "headline": self.headline(),
+        }
+
+
+def load_account_limit(max_bytes: int = 4_000_000) -> Optional[AccountLimit]:
+    """Latest account quota from Grok CLI billing log (same as /usage)."""
+    log = grok_home() / "logs" / "unified.jsonl"
+    if not log.is_file():
+        # Weak fallback: last clipboard text from TUI copy
+        lc = grok_home() / "last-copy.txt"
+        if lc.is_file():
+            text = lc.read_text(encoding="utf-8", errors="replace").strip()
+            m = re.search(
+                r"(Weekly|Monthly)\s+limit:\s*([0-9]+(?:\.[0-9]+)?)\s*%",
+                text,
+                re.I,
+            )
+            if m:
+                return AccountLimit(
+                    percent=float(m.group(2)),
+                    period_label=m.group(1).capitalize(),
+                    period_type="",
+                    period_start=None,
+                    period_end=None,
+                    subscription=None,
+                    fetched_at=None,
+                    source="last-copy",
+                )
+        return None
+
+    try:
+        size = log.stat().st_size
+        with log.open("rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+            data = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+    last: Optional[dict] = None
+    for line in data.splitlines():
+        if "billing: fetched credits config" not in line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("msg") != "billing: fetched credits config":
+            continue
+        last = obj
+    if not last:
+        return None
+
+    ctx = last.get("ctx") or {}
+    cfg = ctx.get("config") or {}
+    period = cfg.get("currentPeriod") or {}
+    ptype = str(period.get("type") or "")
+    if "WEEKLY" in ptype.upper():
+        label = "Weekly"
+    elif "MONTHLY" in ptype.upper():
+        label = "Monthly"
+    else:
+        label = "Period"
+    pct = cfg.get("creditUsagePercent")
+    try:
+        pct_f = float(pct) if pct is not None else None
+    except (TypeError, ValueError):
+        pct_f = None
+    sub = ctx.get("subscriptionTiers") or ctx.get("subscription_tier") or cfg.get(
+        "subscription_tier"
+    )
+    if isinstance(sub, list):
+        sub = ",".join(str(x) for x in sub)
+    return AccountLimit(
+        percent=pct_f,
+        period_label=label,
+        period_type=ptype,
+        period_start=period.get("start") or cfg.get("billingPeriodStart"),
+        period_end=period.get("end") or cfg.get("billingPeriodEnd"),
+        subscription=str(sub) if sub else None,
+        fetched_at=last.get("ts"),
+        source="unified.jsonl",
+    )
 
 
 def discover_sessions(root: Path, limit: int) -> List[Path]:
@@ -524,9 +655,7 @@ def filter_sessions(
 # Output (colors + tables)
 # ---------------------------------------------------------------------------
 
-import re as _re
-
-_ANSI_RE = _re.compile(r"\x1b\[[0-9;]*m")
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 # Force / disable via env or --no-color
 _USE_COLOR: Optional[bool] = None
@@ -725,16 +854,79 @@ def print_table(
     print(_hline(bl, t_up, br))
 
 
-def print_daily(dailies: List[DailyStat], as_json: bool, verbose: bool = False) -> None:
+def print_account_limit_banner(limit: Optional["AccountLimit"]) -> None:
+    if not limit:
+        return
+    head = limit.headline()
+    # color by pressure
+    pct = limit.percent
+    if pct is not None and pct >= 95:
+        head_s = _c("1;31", head)  # bold red
+    elif pct is not None and pct >= 80:
+        head_s = yellow(bold(head))
+    else:
+        head_s = green(bold(head))
+    bits = [head_s]
+    if limit.period_end:
+        bits.append(dim(f"reset {str(limit.period_end)[:10]}"))
+    if limit.subscription:
+        bits.append(cyan(str(limit.subscription)))
+    if limit.fetched_at:
+        bits.append(dim(f"as of {str(limit.fetched_at)[:19].replace('T', ' ')} UTC"))
+    print("  ·  ".join(bits))
+    print()
+
+
+def print_limit_detail(limit: Optional[AccountLimit], as_json: bool) -> None:
     if as_json:
-        print(json.dumps([d.as_public_dict() for d in dailies], indent=2))
+        print(json.dumps(limit.as_public_dict() if limit else None, indent=2))
+        return
+    if not limit:
+        print(yellow("No account limit data found."))
+        print(dim("Open Grok CLI and run /usage once, or keep a session running so billing is logged."))
+        print(dim(f"Expected log: {grok_home() / 'logs' / 'unified.jsonl'}"))
+        return
+    print(bold(cyan("Grok Account Limit")) + dim("  ·  same source as /usage"))
+    print()
+    print_account_limit_banner(limit)
+    rows = [
+        ["Field", "Value"],
+    ]
+    # manual simple print without full table headers conflict
+    print(f"  Limit        {limit.headline()}")
+    print(f"  Period       {limit.period_label} ({limit.period_type or '—'})")
+    print(f"  Start        {limit.period_start or '—'}")
+    print(f"  End / reset  {limit.period_end or '—'}")
+    print(f"  Plan         {limit.subscription or '—'}")
+    print(f"  Fetched      {limit.fetched_at or '—'}")
+    print(f"  Source       {limit.source}")
+    print()
+    print(dim("Note: This is account quota %, not local session token totals."))
+
+
+def print_daily(
+    dailies: List[DailyStat],
+    as_json: bool,
+    verbose: bool = False,
+    account_limit: Optional[AccountLimit] = None,
+) -> None:
+    if as_json:
+        payload = {
+            "account_limit": account_limit.as_public_dict() if account_limit else None,
+            "daily": [d.as_public_dict() for d in dailies],
+        }
+        print(json.dumps(payload, indent=2))
         return
     if not dailies:
+        print(bold(cyan("Grok Tokens")) + dim("  ·  daily (UTC)"))
+        print()
+        print_account_limit_banner(account_limit)
         print(yellow("No usage events found."))
         return
 
     print(bold(cyan("Grok Tokens")) + dim("  ·  daily (UTC)"))
     print()
+    print_account_limit_banner(account_limit)
 
     headers = [
         "Date",
@@ -815,6 +1007,7 @@ def print_sessions(
     as_json: bool,
     sort: str,
     verbose: bool = False,
+    account_limit: Optional[AccountLimit] = None,
 ) -> None:
     ordered = list(stats)
     if sort == "recent":
@@ -823,14 +1016,22 @@ def print_sessions(
         ordered.sort(key=lambda s: s.tokens.total_tokens, reverse=True)
 
     if as_json:
-        print(json.dumps([s.as_public_dict() for s in ordered], indent=2))
+        payload = {
+            "account_limit": account_limit.as_public_dict() if account_limit else None,
+            "sessions": [s.as_public_dict() for s in ordered],
+        }
+        print(json.dumps(payload, indent=2))
         return
     if not ordered:
+        print(bold(cyan("Grok Tokens")) + dim("  ·  session (UTC)"))
+        print()
+        print_account_limit_banner(account_limit)
         print(yellow("No sessions found."))
         return
 
     print(bold(cyan("Grok Tokens")) + dim("  ·  session (UTC)"))
     print()
+    print_account_limit_banner(account_limit)
 
     headers = [
         "Session",
@@ -973,6 +1174,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sort by total tokens (default) or last activity",
     )
 
+    sub.add_parser(
+        "limit",
+        parents=[shared],
+        help="Account Weekly/Monthly limit (same source as Grok /usage)",
+    )
+
     return p
 
 
@@ -983,6 +1190,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if getattr(args, "no_color", False):
         _USE_COLOR = False
+
+    account_limit = load_account_limit()
+
+    if args.command == "limit":
+        print_limit_detail(account_limit, args.json)
+        return 0 if account_limit else 1
 
     root = Path(args.root) if args.root else sessions_root()
     if not root.is_dir():
@@ -1011,7 +1224,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.command == "daily":
         dailies = daily_from_raw(root, session_dirs, args.since)
-        print_daily(dailies, args.json, verbose=args.verbose)
+        print_daily(
+            dailies, args.json, verbose=args.verbose, account_limit=account_limit
+        )
         return 0
 
     if args.command == "session":
@@ -1026,7 +1241,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             cwd=None,  # already filtered dirs
             usage_only=args.usage_only,
         )
-        print_sessions(stats, args.json, sort=args.sort, verbose=args.verbose)
+        print_sessions(
+            stats,
+            args.json,
+            sort=args.sort,
+            verbose=args.verbose,
+            account_limit=account_limit,
+        )
         return 0
 
     parser.error(f"unknown command {args.command}")

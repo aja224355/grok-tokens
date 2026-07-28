@@ -225,26 +225,224 @@ impl DailyStat {
 
 // ── Paths / discovery ─────────────────────────────────────────────────────
 
+fn dirs_home() -> PathBuf {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn grok_home() -> PathBuf {
+    if let Ok(h) = env::var("GROK_HOME") {
+        if !h.trim().is_empty() {
+            return PathBuf::from(h);
+        }
+    }
+    dirs_home().join(".grok")
+}
+
 fn sessions_root() -> PathBuf {
     if let Ok(d) = env::var("GROK_DATA_DIR") {
         if !d.trim().is_empty() {
             return PathBuf::from(d);
         }
     }
-    if let Ok(h) = env::var("GROK_HOME") {
-        let p = PathBuf::from(h).join("sessions");
-        if p.is_dir() {
-            return p;
-        }
+    let p = grok_home().join("sessions");
+    if p.is_dir() {
+        return p;
     }
     dirs_home().join(".grok").join("sessions")
 }
 
-fn dirs_home() -> PathBuf {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("."))
+// ── Account limit (Weekly/Monthly — same as Grok /usage) ─────────────────
+
+#[derive(Debug, Clone, Serialize)]
+struct AccountLimit {
+    percent: Option<f64>,
+    period_label: String,
+    period_type: String,
+    period_start: Option<String>,
+    period_end: Option<String>,
+    subscription: Option<String>,
+    fetched_at: Option<String>,
+    source: String,
+}
+
+impl AccountLimit {
+    fn headline(&self) -> String {
+        match self.percent {
+            Some(p) if (p - p.round()).abs() < 1e-9 => {
+                format!("{} limit: {:.0}%", self.period_label, p)
+            }
+            Some(p) => format!("{} limit: {}%", self.period_label, p),
+            None => format!("{} limit: n/a", self.period_label),
+        }
+    }
+
+    fn as_public(&self) -> Value {
+        serde_json::json!({
+            "percent": self.percent,
+            "period_label": self.period_label,
+            "period_type": self.period_type,
+            "period_start": self.period_start,
+            "period_end": self.period_end,
+            "subscription": self.subscription,
+            "fetched_at": self.fetched_at,
+            "source": self.source,
+            "headline": self.headline(),
+        })
+    }
+}
+
+fn load_account_limit(max_bytes: u64) -> Option<AccountLimit> {
+    let log = grok_home().join("logs").join("unified.jsonl");
+    if !log.is_file() {
+        // Weak fallback: last TUI clipboard
+        let lc = grok_home().join("last-copy.txt");
+        if let Ok(text) = fs::read_to_string(lc) {
+            let re = Regex::new(r"(?i)(Weekly|Monthly)\s+limit:\s*([0-9]+(?:\.[0-9]+)?)\s*%")
+                .ok()?;
+            if let Some(c) = re.captures(text.trim()) {
+                return Some(AccountLimit {
+                    percent: c.get(2).and_then(|m| m.as_str().parse().ok()),
+                    period_label: c
+                        .get(1)
+                        .map(|m| {
+                            let s = m.as_str();
+                            format!(
+                                "{}{}",
+                                s.chars().next().unwrap().to_uppercase(),
+                                s[1..].to_lowercase()
+                            )
+                        })
+                        .unwrap_or_else(|| "Period".into()),
+                    period_type: String::new(),
+                    period_start: None,
+                    period_end: None,
+                    subscription: None,
+                    fetched_at: None,
+                    source: "last-copy".into(),
+                });
+            }
+        }
+        return None;
+    }
+
+    let meta = fs::metadata(&log).ok()?;
+    let size = meta.len();
+    let file = File::open(&log).ok()?;
+    let mut reader = BufReader::new(file);
+    if size > max_bytes {
+        use std::io::{Seek, SeekFrom};
+        let _ = reader.seek(SeekFrom::Start(size - max_bytes));
+        // skip partial first line
+        let mut skip = String::new();
+        let _ = reader.read_line(&mut skip);
+    }
+
+    let mut last: Option<Value> = None;
+    for line in reader.lines().map_while(Result::ok) {
+        if !line.contains("billing: fetched credits config") {
+            continue;
+        }
+        if let Ok(obj) = serde_json::from_str::<Value>(&line) {
+            if obj.get("msg").and_then(|m| m.as_str()) == Some("billing: fetched credits config")
+            {
+                last = Some(obj);
+            }
+        }
+    }
+    let last = last?;
+    let ctx = last.get("ctx")?;
+    let cfg = ctx.get("config")?;
+    let period = cfg.get("currentPeriod");
+    let ptype = period
+        .and_then(|p| p.get("type"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    let label = if ptype.to_uppercase().contains("WEEKLY") {
+        "Weekly"
+    } else if ptype.to_uppercase().contains("MONTHLY") {
+        "Monthly"
+    } else {
+        "Period"
+    };
+    let percent = cfg
+        .get("creditUsagePercent")
+        .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)));
+    let period_start = period
+        .and_then(|p| p.get("start"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            cfg.get("billingPeriodStart")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        });
+    let period_end = period
+        .and_then(|p| p.get("end"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            cfg.get("billingPeriodEnd")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        });
+    let sub = ctx
+        .get("subscriptionTiers")
+        .or_else(|| ctx.get("subscription_tier"))
+        .or_else(|| cfg.get("subscription_tier"))
+        .map(|v| match v {
+            Value::String(s) => s.clone(),
+            Value::Array(a) => a
+                .iter()
+                .filter_map(|x| x.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            other => other.to_string(),
+        })
+        .filter(|s| !s.is_empty() && s != "null");
+
+    Some(AccountLimit {
+        percent,
+        period_label: label.into(),
+        period_type: ptype,
+        period_start,
+        period_end,
+        subscription: sub,
+        fetched_at: last
+            .get("ts")
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string()),
+        source: "unified.jsonl".into(),
+    })
+}
+
+fn print_account_limit_banner(limit: &AccountLimit, color: bool) {
+    let head = limit.headline();
+    let head_s = match limit.percent {
+        Some(p) if p >= 95.0 => c(color, "1;31", &head),
+        Some(p) if p >= 80.0 => c(color, "1;33", &head),
+        _ => c(color, "1;32", &head),
+    };
+    let mut bits = vec![head_s];
+    if let Some(ref end) = limit.period_end {
+        bits.push(c(color, "2", &format!("reset {}", &end[..end.len().min(10)])));
+    }
+    if let Some(ref sub) = limit.subscription {
+        bits.push(c(color, "36", sub));
+    }
+    if let Some(ref ts) = limit.fetched_at {
+        let shown = ts.replace('T', " ");
+        bits.push(c(
+            color,
+            "2",
+            &format!("as of {} UTC", &shown[..shown.len().min(19)]),
+        ));
+    }
+    println!("{}", bits.join("  ·  "));
+    println!();
 }
 
 fn discover_sessions(root: &Path, limit: usize) -> Vec<PathBuf> {
@@ -676,14 +874,19 @@ fn print_table(headers: &[String], rows: &[Vec<String>], color: bool, total_row:
     println!("{}", hline("╰", "┴", "╯"));
 }
 
-fn print_daily(dailies: &[DailyStat], json: bool, verbose: bool, color: bool) {
+fn print_daily(
+    dailies: &[DailyStat],
+    json: bool,
+    verbose: bool,
+    color: bool,
+    account_limit: Option<&AccountLimit>,
+) {
     if json {
-        let arr: Vec<_> = dailies.iter().map(|d| d.as_public()).collect();
-        println!("{}", serde_json::to_string_pretty(&arr).unwrap());
-        return;
-    }
-    if dailies.is_empty() {
-        println!("{}", c(color, "33", "No usage events found."));
+        let payload = serde_json::json!({
+            "account_limit": account_limit.map(|l| l.as_public()),
+            "daily": dailies.iter().map(|d| d.as_public()).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload).unwrap());
         return;
     }
 
@@ -693,6 +896,13 @@ fn print_daily(dailies: &[DailyStat], json: bool, verbose: bool, color: bool) {
         c(color, "2", "  ·  daily (UTC)")
     );
     println!();
+    if let Some(l) = account_limit {
+        print_account_limit_banner(l, color);
+    }
+    if dailies.is_empty() {
+        println!("{}", c(color, "33", "No usage events found."));
+        return;
+    }
 
     let mut headers = vec![
         "Date", "Reqs", "Sess", "Input", "Cache", "Hit%", "Fresh", "Output", "Total", "NoCache",
@@ -787,7 +997,14 @@ fn print_daily(dailies: &[DailyStat], json: bool, verbose: bool, color: bool) {
     }
 }
 
-fn print_sessions(stats: &[SessionStat], json: bool, sort: SortMode, verbose: bool, color: bool) {
+fn print_sessions(
+    stats: &[SessionStat],
+    json: bool,
+    sort: SortMode,
+    verbose: bool,
+    color: bool,
+    account_limit: Option<&AccountLimit>,
+) {
     let mut ordered = stats.to_vec();
     match sort {
         SortMode::Recent => ordered.sort_by(|a, b| b.last_activity.cmp(&a.last_activity)),
@@ -795,12 +1012,11 @@ fn print_sessions(stats: &[SessionStat], json: bool, sort: SortMode, verbose: bo
     }
 
     if json {
-        let arr: Vec<_> = ordered.iter().map(|s| s.as_public()).collect();
-        println!("{}", serde_json::to_string_pretty(&arr).unwrap());
-        return;
-    }
-    if ordered.is_empty() {
-        println!("{}", c(color, "33", "No sessions found."));
+        let payload = serde_json::json!({
+            "account_limit": account_limit.map(|l| l.as_public()),
+            "sessions": ordered.iter().map(|s| s.as_public()).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload).unwrap());
         return;
     }
 
@@ -810,6 +1026,13 @@ fn print_sessions(stats: &[SessionStat], json: bool, sort: SortMode, verbose: bo
         c(color, "2", "  ·  session (UTC)")
     );
     println!();
+    if let Some(l) = account_limit {
+        print_account_limit_banner(l, color);
+    }
+    if ordered.is_empty() {
+        println!("{}", c(color, "33", "No sessions found."));
+        return;
+    }
 
     let mut headers = vec![
         "Session", "Reqs", "Input", "Cache", "Hit%", "Fresh", "Output", "Total", "NoCache",
@@ -976,6 +1199,8 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = SortMode::Total)]
         sort: SortMode,
     },
+    /// Account Weekly/Monthly limit (same source as Grok /usage)
+    Limit,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, Default)]
@@ -990,9 +1215,97 @@ fn path_norm(p: &str) -> PathBuf {
     PathBuf::from(p)
 }
 
+fn print_limit_detail(limit: Option<&AccountLimit>, json: bool, color: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&limit.map(|l| l.as_public())).unwrap()
+        );
+        return;
+    }
+    match limit {
+        None => {
+            println!("{}", c(color, "33", "No account limit data found."));
+            println!(
+                "{}",
+                c(
+                    color,
+                    "2",
+                    "Open Grok CLI and run /usage once, or keep a session running so billing is logged."
+                )
+            );
+            println!(
+                "{}",
+                c(
+                    color,
+                    "2",
+                    &format!(
+                        "Expected log: {}",
+                        grok_home().join("logs").join("unified.jsonl").display()
+                    )
+                )
+            );
+        }
+        Some(l) => {
+            println!(
+                "{}{}",
+                c(color, "1;36", "Grok Account Limit"),
+                c(color, "2", "  ·  same source as /usage")
+            );
+            println!();
+            print_account_limit_banner(l, color);
+            println!("  Limit        {}", l.headline());
+            println!(
+                "  Period       {} ({})",
+                l.period_label,
+                if l.period_type.is_empty() {
+                    "—"
+                } else {
+                    &l.period_type
+                }
+            );
+            println!(
+                "  Start        {}",
+                l.period_start.as_deref().unwrap_or("—")
+            );
+            println!(
+                "  End / reset  {}",
+                l.period_end.as_deref().unwrap_or("—")
+            );
+            println!(
+                "  Plan         {}",
+                l.subscription.as_deref().unwrap_or("—")
+            );
+            println!(
+                "  Fetched      {}",
+                l.fetched_at.as_deref().unwrap_or("—")
+            );
+            println!("  Source       {}", l.source);
+            println!();
+            println!(
+                "{}",
+                c(
+                    color,
+                    "2",
+                    "Note: This is account quota %, not local session token totals."
+                )
+            );
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let color = use_color(cli.no_color);
+    let account_limit = load_account_limit(4_000_000);
+
+    if matches!(cli.command, Commands::Limit) {
+        print_limit_detail(account_limit.as_ref(), cli.json, color);
+        if account_limit.is_none() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     let root = cli.root.clone().unwrap_or_else(sessions_root);
     if !root.is_dir() {
@@ -1025,7 +1338,13 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Daily => {
             let dailies = daily_from_raw(&session_dirs, cli.since.as_deref());
-            print_daily(&dailies, cli.json, cli.verbose, color);
+            print_daily(
+                &dailies,
+                cli.json,
+                cli.verbose,
+                color,
+                account_limit.as_ref(),
+            );
         }
         Commands::Session { sort } => {
             let mut stats: Vec<SessionStat> = session_dirs
@@ -1034,14 +1353,23 @@ fn main() -> Result<()> {
                 .collect();
             if let Some(ref since) = cli.since {
                 stats.retain(|s| {
-                    s.last_activity_day == "unknown" || s.last_activity_day.as_str() >= since.as_str()
+                    s.last_activity_day == "unknown"
+                        || s.last_activity_day.as_str() >= since.as_str()
                 });
             }
             if cli.usage_only {
                 stats.retain(|s| s.has_usage);
             }
-            print_sessions(&stats, cli.json, sort, cli.verbose, color);
+            print_sessions(
+                &stats,
+                cli.json,
+                sort,
+                cli.verbose,
+                color,
+                account_limit.as_ref(),
+            );
         }
+        Commands::Limit => unreachable!(),
     }
 
     Ok(())

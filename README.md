@@ -71,7 +71,13 @@ grok-tokens daily --json
 
 grok-tokens session --usage-only
 grok-tokens session --sort recent
+
+# Account quota (same as Grok CLI /usage "Weekly limit: 24%")
+grok-tokens limit
 ```
+
+Account limit is read from `~/.grok/logs/unified.jsonl` (`billing: fetched credits config`), which the Grok CLI refreshes while sessions run. It is **not** derived from local token sums.
+
 
 | Flag | Description |
 |------|-------------|
