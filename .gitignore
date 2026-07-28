@@ -8,5 +8,8 @@ venv/
 .ruff_cache/
 dist/
 build/
+target/
 *.log
 .DS_Store
+/grok-tokens
+*.tar.gz

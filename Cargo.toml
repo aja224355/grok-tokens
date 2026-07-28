@@ -1,0 +1,29 @@
+[package]
+name = "grok-tokens"
+version = "0.1.0"
+edition = "2021"
+description = "Count real Grok Build usage tokens from local session logs"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/alientek/grok-tokens"
+keywords = ["grok", "xai", "tokens", "cli", "usage"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "grok-tokens"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "z"
