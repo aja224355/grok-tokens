@@ -1,0 +1,44 @@
+name: Release
+
+# Publish a portable single-file executable on version tags:
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# Asset name: "grok-tokens" (same file for all platforms — pure Python).
+# install.sh downloads this asset first, then falls back to raw main.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build portable executable asset
+        run: |
+          chmod +x grok_tokens.py
+          # Ship as "grok-tokens" with shebang preserved
+          cp grok_tokens.py grok-tokens
+          chmod +x grok-tokens
+          python3 grok-tokens --version
+          python3 -m py_compile grok-tokens
+
+      - name: Create GitHub Release + upload asset
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            grok-tokens
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,4 +1,2 @@
 #!/usr/bin/env bash
-# grok-tokens — run from repo checkout
-ROOT="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")/.." && pwd)"
-exec python3 "$ROOT/grok_tokens.py" "$@"
+exec python3 "/home/alientek/git/grok-tokens/grok_tokens.py" "$@"

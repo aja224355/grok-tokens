@@ -2,15 +2,13 @@
 """
 grok-tokens — count real Grok Build usage tokens from local session logs.
 
-Unlike grok-usage (peak context / growth from cumulative _meta.totalTokens),
-this tool sums per-turn usage fields:
+Pure Python 3 (stdlib only). Install once; no runtime deps.
 
-  usage.inputTokens
-  usage.outputTokens
-  usage.totalTokens
-  usage.cachedReadTokens
-  usage.reasoningTokens
-  usage.costUsdTicks
+Unlike peak-context tools that sum cumulative _meta.totalTokens, this tool
+sums per-turn usage fields:
+
+  usage.inputTokens / outputTokens / totalTokens
+  usage.cachedReadTokens / reasoningTokens / costUsdTicks
 
 Commands:
   daily    Aggregate by UTC calendar day
@@ -20,7 +18,7 @@ Examples:
   grok-tokens daily
   grok-tokens session --limit 20
   grok-tokens daily --since 2026-07-27 --json
-  grok-tokens session --cwd /home/alientek/rv1126b
+  grok-tokens session --cwd /path/to/project
 """
 
 from __future__ import annotations
@@ -34,6 +32,9 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+__version__ = "0.1.0"
+VERSION = __version__
 
 
 # ---------------------------------------------------------------------------
@@ -935,6 +936,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-color",
         action="store_true",
         help="Disable ANSI colors",
+    )
+    shared.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"grok-tokens {__version__}",
     )
 
     p = argparse.ArgumentParser(

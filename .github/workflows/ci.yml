@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.8", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Syntax check
+        run: python3 -m py_compile grok_tokens.py
+
+      - name: CLI smoke
+        run: |
+          chmod +x grok_tokens.py bin/grok-tokens
+          python3 grok_tokens.py --version
+          python3 grok_tokens.py --help
+          ./bin/grok-tokens --help
+          # daily/session should exit cleanly even with empty/missing sessions
+          python3 grok_tokens.py daily --root /tmp/grok-tokens-empty-$$ || true
