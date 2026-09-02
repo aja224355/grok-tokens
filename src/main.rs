@@ -303,6 +303,9 @@ struct AccountLimit {
     subscription: Option<String>,
     fetched_at: Option<String>,
     source: String,
+    email: Option<String>,
+    user_id: Option<String>,
+    profile: Option<String>,
 }
 
 impl AccountLimit {
@@ -327,6 +330,9 @@ impl AccountLimit {
             "fetched_at": self.fetched_at,
             "source": self.source,
             "headline": self.headline(),
+            "email": self.email,
+            "user_id": self.user_id,
+            "profile": self.profile,
         })
     }
 }
@@ -359,6 +365,9 @@ fn load_account_limit(max_bytes: u64) -> Option<AccountLimit> {
                     subscription: None,
                     fetched_at: None,
                     source: "last-copy".into(),
+                    email: None,
+                    user_id: None,
+                    profile: None,
                 });
             }
         }
@@ -453,6 +462,9 @@ fn load_account_limit(max_bytes: u64) -> Option<AccountLimit> {
             .and_then(|t| t.as_str())
             .map(|s| s.to_string()),
         source: "unified.jsonl".into(),
+        email: None,
+        user_id: None,
+        profile: None,
     })
 }
 
@@ -463,7 +475,14 @@ fn print_account_limit_banner(limit: &AccountLimit, color: bool) {
         Some(p) if p >= 80.0 => c(color, "1;33", &head),
         _ => c(color, "1;32", &head),
     };
-    let mut bits = vec![head_s];
+    let mut bits = Vec::new();
+    if let Some(ref email) = limit.email {
+        bits.push(c(color, "1", email));
+    }
+    if let Some(ref profile) = limit.profile {
+        bits.push(c(color, "32", &format!("profile {profile}")));
+    }
+    bits.push(head_s);
     if let Some(ref end) = limit.period_end {
         bits.push(c(color, "2", &format!("reset {}", &end[..end.len().min(10)])));
     }
@@ -911,6 +930,201 @@ fn print_table(headers: &[String], rows: &[Vec<String>], color: bool, total_row:
     println!("{}", hline("╰", "┴", "╯"));
 }
 
+#[derive(Serialize)]
+struct AccountRow {
+    name: String,
+    email: Option<String>,
+    user_id: Option<String>,
+    active: bool,
+    unsaved: bool,
+    limit: Option<AccountLimit>,
+}
+
+fn collect_account_rows(live_limit: Option<&AccountLimit>) -> Vec<AccountRow> {
+    let live = live_identity();
+    let live_uid = live.as_ref().and_then(|i| i.user_id.clone());
+    let names = list_profile_names().unwrap_or_default();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut rows = Vec::new();
+
+    for name in names {
+        let stored = read_json(&profile_auth_path(&name)).ok();
+        let id = stored.as_ref().and_then(identity_from_auth);
+        let uid = id.as_ref().and_then(|i| i.user_id.clone());
+        let active = match (live_uid.as_deref(), uid.as_deref()) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        };
+        if let Some(u) = &uid {
+            seen.insert(u.clone());
+        }
+        let limit = if active {
+            live_limit.cloned()
+        } else {
+            let mut stored_limit = read_profile_limit(&name);
+            if let Some(ref mut l) = stored_limit {
+                if l.email.is_none() {
+                    l.email = id.as_ref().and_then(|i| i.email.clone());
+                }
+                if l.profile.is_none() {
+                    l.profile = Some(name.clone());
+                }
+            }
+            stored_limit
+        };
+        rows.push(AccountRow {
+            name,
+            email: id.as_ref().and_then(|i| i.email.clone()),
+            user_id: uid,
+            active,
+            unsaved: false,
+            limit,
+        });
+    }
+
+    if let Some(id) = live {
+        let uid = id.user_id.clone();
+        let already = uid.as_ref().is_some_and(|u| seen.contains(u));
+        if !already {
+            rows.insert(
+                0,
+                AccountRow {
+                    name: id
+                        .email
+                        .as_deref()
+                        .map(default_profile_name_from_email)
+                        .unwrap_or_else(|| "(current)".into()),
+                    email: id.email.clone(),
+                    user_id: uid,
+                    active: true,
+                    unsaved: true,
+                    limit: live_limit.cloned(),
+                },
+            );
+        }
+    }
+    rows
+}
+
+fn default_profile_name_from_email(email: &str) -> String {
+    default_profile_name(&AuthIdentity {
+        email: Some(email.to_string()),
+        user_id: None,
+        first_name: None,
+        last_name: None,
+        expires_at: None,
+        auth_mode: None,
+    })
+}
+
+fn print_account_overview(live_limit: Option<&AccountLimit>, color: bool) {
+    let rows = collect_account_rows(live_limit);
+    if rows.is_empty() {
+        if let Some(l) = live_limit {
+            print_account_limit_banner(l, color);
+        }
+        return;
+    }
+    if rows.len() == 1 && !rows[0].unsaved {
+        if let Some(l) = live_limit.or(rows[0].limit.as_ref()) {
+            print_account_limit_banner(l, color);
+        } else {
+            println!(
+                "{}{}",
+                c(
+                    color,
+                    "1",
+                    rows[0].email.as_deref().unwrap_or(&rows[0].name)
+                ),
+                c(color, "2", "  ·  no quota in logs yet")
+            );
+            println!();
+        }
+        return;
+    }
+    if rows.len() == 1 && rows[0].unsaved {
+        if let Some(l) = live_limit {
+            print_account_limit_banner(l, color);
+        } else {
+            println!(
+                "{}{}",
+                c(
+                    color,
+                    "1",
+                    rows[0].email.as_deref().unwrap_or("signed in")
+                ),
+                c(color, "2", "  ·  no quota in logs yet")
+            );
+            println!();
+        }
+        return;
+    }
+
+    let headers = vec![
+        "".into(),
+        "Profile".into(),
+        "Account".into(),
+        "Limit".into(),
+        "Reset".into(),
+    ];
+    let mut table = Vec::new();
+    for r in &rows {
+        let mark = if r.active {
+            c(color, "1;32", "*")
+        } else {
+            " ".into()
+        };
+        let pname = if r.unsaved {
+            format!("{} (unsaved)", r.name)
+        } else {
+            r.name.clone()
+        };
+        let email = r.email.as_deref().unwrap_or("—");
+        let (limit_s, reset_s) = match &r.limit {
+            Some(l) => {
+                let reset = l
+                    .period_end
+                    .as_deref()
+                    .map(|e| e[..e.len().min(10)].to_string())
+                    .unwrap_or_else(|| "—".into());
+                (l.headline(), reset)
+            }
+            None => ("—".into(), "—".into()),
+        };
+        table.push(vec![
+            mark,
+            if r.active {
+                c(color, "1;32", &pname)
+            } else {
+                pname
+            },
+            email.into(),
+            if r.active {
+                match r.limit.as_ref().and_then(|l| l.percent) {
+                    Some(p) if p >= 95.0 => c(color, "1;31", &limit_s),
+                    Some(p) if p >= 80.0 => c(color, "1;33", &limit_s),
+                    Some(_) => c(color, "1;32", &limit_s),
+                    None => limit_s,
+                }
+            } else {
+                c(color, "2", &limit_s)
+            },
+            c(color, "2", &reset_s),
+        ]);
+    }
+    print_table(&headers, &table, color, false);
+    println!();
+    println!(
+        "{}",
+        c(
+            color,
+            "2",
+            "Limit = current (or last saved) Grok /usage quota. Token table below is local logs, not split by account."
+        )
+    );
+    println!();
+}
+
 fn print_daily(
     dailies: &[DailyStat],
     json: bool,
@@ -921,6 +1135,7 @@ fn print_daily(
     if json {
         let payload = serde_json::json!({
             "account_limit": account_limit.map(|l| l.as_public()),
+            "accounts": collect_account_rows(account_limit),
             "daily": dailies.iter().map(|d| d.as_public()).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&payload).unwrap());
@@ -933,9 +1148,7 @@ fn print_daily(
         c(color, "2", "  ·  daily (UTC)")
     );
     println!();
-    if let Some(l) = account_limit {
-        print_account_limit_banner(l, color);
-    }
+    print_account_overview(account_limit, color);
     if dailies.is_empty() {
         println!("{}", c(color, "33", "No usage events found."));
         return;
@@ -1051,6 +1264,7 @@ fn print_sessions(
     if json {
         let payload = serde_json::json!({
             "account_limit": account_limit.map(|l| l.as_public()),
+            "accounts": collect_account_rows(account_limit),
             "sessions": ordered.iter().map(|s| s.as_public()).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&payload).unwrap());
@@ -1063,9 +1277,7 @@ fn print_sessions(
         c(color, "2", "  ·  session (UTC)")
     );
     println!();
-    if let Some(l) = account_limit {
-        print_account_limit_banner(l, color);
-    }
+    print_account_overview(account_limit, color);
     if ordered.is_empty() {
         println!("{}", c(color, "33", "No sessions found."));
         return;
@@ -1299,6 +1511,83 @@ fn validate_profile_name(name: &str) -> Result<()> {
 
 fn profile_auth_path(name: &str) -> PathBuf {
     profiles_dir().join(name).join("auth.json")
+}
+
+fn profile_limit_path(name: &str) -> PathBuf {
+    profiles_dir().join(name).join("limit.json")
+}
+
+fn account_limit_from_stored(v: &Value) -> Option<AccountLimit> {
+    Some(AccountLimit {
+        percent: v.get("percent").and_then(|x| x.as_f64()),
+        period_label: v
+            .get("period_label")
+            .and_then(|x| x.as_str())
+            .unwrap_or("Period")
+            .to_string(),
+        period_type: v
+            .get("period_type")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        period_start: v
+            .get("period_start")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        period_end: v
+            .get("period_end")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        subscription: v
+            .get("subscription")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        fetched_at: v
+            .get("fetched_at")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        source: v
+            .get("source")
+            .and_then(|x| x.as_str())
+            .unwrap_or("profile")
+            .to_string(),
+        email: v
+            .get("email")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        user_id: v
+            .get("user_id")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        profile: v
+            .get("profile")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+    })
+}
+
+fn read_profile_limit(name: &str) -> Option<AccountLimit> {
+    account_limit_from_stored(&read_json(&profile_limit_path(name)).ok()?)
+}
+
+fn write_profile_limit(name: &str, limit: &AccountLimit) -> Result<()> {
+    write_secret_json(&profile_limit_path(name), &limit.as_public())
+}
+
+fn live_identity() -> Option<AuthIdentity> {
+    identity_from_auth(&read_auth_file().ok()??)
+}
+
+fn enrich_limit(mut limit: AccountLimit) -> AccountLimit {
+    if let Some(id) = live_identity() {
+        limit.email = id.email.clone();
+        limit.user_id = id.user_id.clone();
+        limit.profile = matching_profile(&id).ok().flatten();
+        if let Some(ref name) = limit.profile {
+            let _ = write_profile_limit(name, &limit);
+        }
+    }
+    limit
 }
 
 fn read_json(path: &Path) -> Result<Value> {
@@ -1549,6 +1838,12 @@ fn account_save(name: Option<&str>, json: bool, color: bool) -> Result<()> {
     }
     write_secret_json(&dest, &value)?;
     write_current_profile(&name)?;
+    if let Some(mut limit) = load_account_limit(4_000_000) {
+        limit.email = id.email.clone();
+        limit.user_id = id.user_id.clone();
+        limit.profile = Some(name.clone());
+        let _ = write_profile_limit(&name, &limit);
+    }
     if json {
         println!(
             "{}",
@@ -1690,6 +1985,16 @@ fn account_switch(name: &str, json: bool, color: bool) -> Result<()> {
     })?;
 
     let persisted = persist_live_auth()?;
+    if let Some(ref prev) = persisted {
+        if let Some(mut limit) = load_account_limit(4_000_000) {
+            if let Some(cur) = live_identity() {
+                limit.email = cur.email;
+                limit.user_id = cur.user_id;
+            }
+            limit.profile = Some(prev.clone());
+            let _ = write_profile_limit(prev, &limit);
+        }
+    }
     write_secret_json(&auth_json_path(), &incoming)?;
     write_current_profile(name)?;
 
@@ -1905,6 +2210,9 @@ fn print_limit_detail(limit: Option<&AccountLimit>, json: bool, color: bool) {
             );
             println!();
             print_account_limit_banner(l, color);
+            println!("  Account      {}", l.email.as_deref().unwrap_or("—"));
+            println!("  Profile      {}", l.profile.as_deref().unwrap_or("—"));
+            println!("  User ID      {}", l.user_id.as_deref().unwrap_or("—"));
             println!("  Limit        {}", l.headline());
             println!(
                 "  Period       {} ({})",
@@ -1953,7 +2261,7 @@ fn main() -> Result<()> {
         return run_account(command, cli.json, color);
     }
 
-    let account_limit = load_account_limit(4_000_000);
+    let account_limit = load_account_limit(4_000_000).map(enrich_limit);
 
     if matches!(cli.command, Commands::Limit) {
         print_limit_detail(account_limit.as_ref(), cli.json, color);

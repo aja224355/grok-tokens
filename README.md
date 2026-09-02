@@ -76,6 +76,8 @@ grok-tokens account switch work
 
 Account limit is read from `~/.grok/logs/unified.jsonl` (`billing: fetched credits config`), which the Grok CLI refreshes while sessions run. It is **not** derived from local token sums.
 
+`daily` / `session` / `limit` label that quota with the current `auth.json` email (and profile name, if saved). With multiple saved profiles, they list each account’s last-known limit. Local token totals stay machine-wide — session logs are not tagged by account.
+
 ### Account profiles
 
 Grok stores a single login in `~/.grok/auth.json`. `account` snapshots that file as named profiles (like `gcloud auth` / AWS profiles):
