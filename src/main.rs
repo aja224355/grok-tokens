@@ -19,6 +19,14 @@ use walkdir::WalkDir;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ── Pricing (USD per 1M tokens) — https://docs.x.ai/developers/pricing ────
+//
+// `costUsdTicks` is the CLI's own charge: one tick = 1e-10 USD.
+// A turn_completed row sums every API request in that turn, so recomputing
+// list price from those totals cannot place xAI's 200k long-context cliff
+// (it applies per request, then 2× the whole request). Use ticks when
+// present; the rate table is only a fallback for rows with no ticks.
+
+const COST_USD_TICKS_PER_USD: f64 = 10_000_000_000.0;
 
 type Rates = (f64, f64, f64); // input, cached, output
 
@@ -29,6 +37,9 @@ fn rates_for_model(model: &str) -> (Rates, Rates, u64) {
     }
     if m.contains("grok-4.3") {
         return ((1.25, 0.2, 2.5), (2.5, 0.4, 5.0), 200_000);
+    }
+    if m.contains("grok-4.6") {
+        return ((2.0, 0.5, 6.0), (4.0, 1.0, 12.0), 200_000);
     }
     // grok-4.5 / grok-4.5-build / default
     ((2.0, 0.3, 6.0), (4.0, 0.6, 12.0), 200_000)
@@ -43,24 +54,42 @@ fn model_from_usage(u: &Value) -> String {
     "grok-4.5".into()
 }
 
-fn estimate_api_cost_usd(u: &Value) -> f64 {
+fn cost_from_ticks(ticks: u64) -> f64 {
+    ticks as f64 / COST_USD_TICKS_PER_USD
+}
+
+/// Long-context 2× is only safe when this row is a single API request.
+fn apply_long_context_tier(u: &Value, input_tokens: u64, threshold: u64) -> bool {
+    json_u64(u, "modelCalls") <= 1 && input_tokens >= threshold
+}
+
+fn rate_table_cost(u: &Value, cache_discount: bool) -> f64 {
     let inp = json_u64(u, "inputTokens");
     let out = json_u64(u, "outputTokens");
-    let cache = json_u64(u, "cachedReadTokens");
+    let cache = json_u64(u, "cachedReadTokens").min(inp);
     let fresh = inp.saturating_sub(cache);
     let model = model_from_usage(u);
     let (short, long, thr) = rates_for_model(&model);
-    let (rin, rcache, rout) = if inp >= thr { long } else { short };
-    (fresh as f64 * rin + cache as f64 * rcache + out as f64 * rout) / 1_000_000.0
+    let (rin, rcache, rout) = if apply_long_context_tier(u, inp, thr) {
+        long
+    } else {
+        short
+    };
+    let billed_input = if cache_discount {
+        fresh as f64 * rin + cache as f64 * rcache
+    } else {
+        inp as f64 * rin
+    };
+    (billed_input + out as f64 * rout) / 1_000_000.0
 }
 
-fn estimate_api_cost_no_cache_usd(u: &Value) -> f64 {
-    let inp = json_u64(u, "inputTokens");
-    let out = json_u64(u, "outputTokens");
-    let model = model_from_usage(u);
-    let (short, long, thr) = rates_for_model(&model);
-    let (rin, _rc, rout) = if inp >= thr { long } else { short };
-    (inp as f64 * rin + out as f64 * rout) / 1_000_000.0
+fn event_cost_usd(u: &Value) -> f64 {
+    let ticks = json_u64(u, "costUsdTicks");
+    if ticks > 0 {
+        cost_from_ticks(ticks)
+    } else {
+        rate_table_cost(u, true)
+    }
 }
 
 fn json_u64(v: &Value, key: &str) -> u64 {
@@ -80,6 +109,8 @@ struct TokenBucket {
     reasoning_tokens: u64,
     cost_usd_ticks: u64,
     cost_api_usd: f64,
+    /// List-price estimate on this row's token totals (fallback / Saved$).
+    cost_rate_usd: f64,
     cost_api_no_cache_usd: f64,
     events: u64,
     model_calls: u64,
@@ -94,8 +125,9 @@ impl TokenBucket {
         self.cached_read_tokens += json_u64(u, "cachedReadTokens");
         self.reasoning_tokens += json_u64(u, "reasoningTokens");
         self.cost_usd_ticks += json_u64(u, "costUsdTicks");
-        self.cost_api_usd += estimate_api_cost_usd(u);
-        self.cost_api_no_cache_usd += estimate_api_cost_no_cache_usd(u);
+        self.cost_rate_usd += rate_table_cost(u, true);
+        self.cost_api_usd += event_cost_usd(u);
+        self.cost_api_no_cache_usd += rate_table_cost(u, false);
         self.events += 1;
         self.model_calls += json_u64(u, "modelCalls");
         if let Some(mu) = u.get("modelUsage").and_then(|v| v.as_object()) {
@@ -115,6 +147,7 @@ impl TokenBucket {
         self.reasoning_tokens += o.reasoning_tokens;
         self.cost_usd_ticks += o.cost_usd_ticks;
         self.cost_api_usd += o.cost_api_usd;
+        self.cost_rate_usd += o.cost_rate_usd;
         self.cost_api_no_cache_usd += o.cost_api_no_cache_usd;
         self.events += o.events;
         self.model_calls += o.model_calls;
@@ -128,10 +161,19 @@ impl TokenBucket {
         self.fresh_input_tokens() + self.output_tokens
     }
     fn cost_cli_usd(&self) -> f64 {
-        self.cost_usd_ticks as f64 / 1_000_000_000.0
+        cost_from_ticks(self.cost_usd_ticks)
+    }
+    fn cost_billing_usd(&self) -> f64 {
+        self.cost_cli_usd()
+    }
+    fn cost_public_usd(&self) -> f64 {
+        self.cost_rate_usd
     }
     fn cache_savings_usd(&self) -> f64 {
-        (self.cost_api_no_cache_usd - self.cost_api_usd).max(0.0)
+        (self.cost_api_no_cache_usd - self.cost_rate_usd).max(0.0)
+    }
+    fn round4(x: f64) -> f64 {
+        (x * 10000.0).round() / 10000.0
     }
     fn hit_pct(&self) -> f64 {
         if self.input_tokens == 0 {
@@ -151,8 +193,11 @@ impl TokenBucket {
             "total_without_cache": self.total_without_cache(),
             "reasoning_tokens": self.reasoning_tokens,
             "cost_usd_ticks": self.cost_usd_ticks,
-            "cost_cli_usd": (self.cost_cli_usd() * 10000.0).round() / 10000.0,
-            "cost_api_usd": (self.cost_api_usd * 10000.0).round() / 10000.0,
+            "cost_billing_usd": Self::round4(self.cost_billing_usd()),
+            "cost_public_usd": Self::round4(self.cost_public_usd()),
+            "cost_cli_usd": Self::round4(self.cost_billing_usd()),
+            "cost_api_usd": Self::round4(self.cost_api_usd),
+            "cost_rate_usd": Self::round4(self.cost_public_usd()),
             "cost_api_no_cache_usd": (self.cost_api_no_cache_usd * 10000.0).round() / 10000.0,
             "cache_savings_usd": (self.cache_savings_usd() * 10000.0).round() / 10000.0,
             "events": self.events,
@@ -1156,13 +1201,12 @@ fn print_daily(
 
     let mut headers = vec![
         "Date", "Reqs", "Sess", "Input", "Cache", "Hit%", "Fresh", "Output", "Total", "NoCache",
-        "Cost",
+        "Billing", "API$",
     ]
     .into_iter()
     .map(String::from)
     .collect::<Vec<_>>();
     if verbose {
-        headers.push("Log$".into());
         headers.push("Saved".into());
     }
 
@@ -1185,10 +1229,10 @@ fn print_daily(
             c(color, "35", &fmt_tokens(t.output_tokens)),
             c(color, "1", &fmt_tokens(t.total_tokens)),
             c(color, "33", &fmt_tokens(t.total_without_cache())),
-            c(color, "32", &fmt_money(t.cost_api_usd)),
+            c(color, "32", &fmt_money(t.cost_billing_usd())),
+            c(color, "33", &fmt_money(t.cost_public_usd())),
         ];
         if verbose {
-            row.push(c(color, "2", &fmt_money(t.cost_cli_usd())));
             row.push(c(color, "36", &fmt_money(t.cache_savings_usd())));
         }
         rows.push(row);
@@ -1205,10 +1249,10 @@ fn print_daily(
         fmt_tokens(tot.output_tokens),
         fmt_tokens(tot.total_tokens),
         fmt_tokens(tot.total_without_cache()),
-        fmt_money(tot.cost_api_usd),
+        fmt_money(tot.cost_billing_usd()),
+        fmt_money(tot.cost_public_usd()),
     ];
     if verbose {
-        total_row.push(fmt_money(tot.cost_cli_usd()));
         total_row.push(fmt_money(tot.cache_savings_usd()));
     }
     rows.push(total_row);
@@ -1220,7 +1264,7 @@ fn print_daily(
         c(
             color,
             "2",
-            "Cost = public list price with cache discount (not final invoice)."
+            "Billing = costUsdTicks / 1e10 (CLI / SuperGrok receipt). API$ = public list price on turn totals."
         )
     );
     println!(
@@ -1236,13 +1280,13 @@ fn print_daily(
         c(
             color,
             "2",
-            "Cache ⊂ Input · Fresh = Input − Cache · Input accumulates across turns."
+            "Cache ⊂ Input · Fresh = Input − Cache · 200k 2× on API$ only if modelCalls ≤ 1."
         )
     );
     if !verbose {
         println!(
             "{}",
-            c(color, "2", "Tip: -v shows Log$ (CLI internal) and cache Saved$.")
+            c(color, "2", "Tip: -v shows cache Saved$ vs billing all input at full rate.")
         );
     }
 }
@@ -1285,13 +1329,12 @@ fn print_sessions(
 
     let mut headers = vec![
         "Session", "Reqs", "Input", "Cache", "Hit%", "Fresh", "Output", "Total", "NoCache",
-        "Cost", "Peak", "Last",
+        "Billing", "API$", "Peak", "Last",
     ]
     .into_iter()
     .map(String::from)
     .collect::<Vec<_>>();
     if verbose {
-        headers.push("Log$".into());
         headers.push("Cwd".into());
     }
 
@@ -1319,7 +1362,8 @@ fn print_sessions(
                 c(color, "35", &fmt_tokens(t.output_tokens)),
                 c(color, "1", &fmt_tokens(t.total_tokens)),
                 c(color, "33", &fmt_tokens(t.total_without_cache())),
-                c(color, "32", &fmt_money(t.cost_api_usd)),
+                c(color, "32", &fmt_money(t.cost_billing_usd())),
+                c(color, "33", &fmt_money(t.cost_public_usd())),
                 c(color, "34", &fmt_tokens(s.peak_context())),
                 c(color, "2", &last),
             ]
@@ -1327,6 +1371,7 @@ fn print_sessions(
             vec![
                 c(color, "36", &sid),
                 c(color, "2", "0"),
+                c(color, "2", "-"),
                 c(color, "2", "-"),
                 c(color, "2", "-"),
                 c(color, "2", "-"),
@@ -1360,11 +1405,6 @@ fn print_sessions(
                     .collect();
                 cwd = format!("…{tail}");
             }
-            row.push(if t.events > 0 {
-                c(color, "2", &fmt_money(t.cost_cli_usd()))
-            } else {
-                c(color, "2", "-")
-            });
             row.push(c(color, "2", &cwd));
         }
         rows.push(row);
@@ -1379,7 +1419,7 @@ fn print_sessions(
             color,
             "2",
             &format!(
-                "{} sessions · {} with usage · NoCache=Fresh+Out · Peak=max input",
+                "{} sessions · {} with usage · Billing=CLI receipt · API$=public list · Peak=max input",
                 ordered.len(),
                 n_usage
             )
@@ -1388,7 +1428,7 @@ fn print_sessions(
     if !verbose {
         println!(
             "{}",
-            c(color, "2", "Tip: -v shows Log$ and project path.")
+            c(color, "2", "Tip: -v shows project path.")
         );
     }
 }
@@ -2333,7 +2373,7 @@ struct Cli {
     #[arg(long, global = true)]
     usage_only: bool,
 
-    /// Show Log$ (CLI internal cost) and cache Saved$
+    /// Show cache Saved$ (daily) and project path (session)
     #[arg(short = 'v', long, global = true)]
     verbose: bool,
 
@@ -2641,5 +2681,63 @@ mod tests {
         assert_eq!(identity_from_auth(&raw).unwrap().user_id.as_deref(), Some("uid-1"));
 
         assert!(parse_account_bundle(&json!({"hello": 1})).is_err());
+    }
+
+    fn usage(
+        model: &str,
+        input: u64,
+        cache: u64,
+        output: u64,
+        calls: u64,
+        ticks: u64,
+    ) -> Value {
+        json!({
+            "inputTokens": input,
+            "outputTokens": output,
+            "totalTokens": input + output,
+            "cachedReadTokens": cache,
+            "modelCalls": calls,
+            "costUsdTicks": ticks,
+            "modelUsage": { model: {
+                "inputTokens": input,
+                "outputTokens": output,
+                "totalTokens": input + output,
+                "cachedReadTokens": cache,
+            }}
+        })
+    }
+
+    #[test]
+    fn ticks_are_1e_10_usd() {
+        // 08-14 single-call grok-4.6-build: ticks match official short list price.
+        let u = usage("grok-4.6-build", 13_867, 256, 451, 1, 300_560_000);
+        assert!((event_cost_usd(&u) - 0.030056).abs() < 1e-9);
+        assert!((cost_from_ticks(300_560_000) - 0.030056).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cost_prefers_ticks_over_rate_table() {
+        // Same tokens as a 200k+ multi-call turn: ticks win, even though the
+        // old logic would have applied the 2× cliff to the whole sum.
+        let u = usage("grok-4.6-build", 4_256_897, 4_185_984, 21_905, 24, 4_403_000_000);
+        assert!((event_cost_usd(&u) - 0.4403).abs() < 1e-9);
+        assert!(rate_table_cost(&u, true) > event_cost_usd(&u) * 4.0);
+    }
+
+    #[test]
+    fn rate_table_skips_200k_cliff_on_aggregated_turns() {
+        let multi = usage("grok-4.6-build", 250_000, 0, 0, 5, 0);
+        let single = usage("grok-4.6-build", 250_000, 0, 0, 1, 0);
+        // Short $2/M vs long $4/M.
+        assert!((rate_table_cost(&multi, true) - 0.50).abs() < 1e-9);
+        assert!((rate_table_cost(&single, true) - 1.00).abs() < 1e-9);
+    }
+
+    #[test]
+    fn grok_46_cache_rate_differs_from_45() {
+        let u46 = usage("grok-4.6-build", 1_000_000, 1_000_000, 0, 2, 0);
+        let u45 = usage("grok-4.5-build", 1_000_000, 1_000_000, 0, 2, 0);
+        assert!((rate_table_cost(&u46, true) - 0.50).abs() < 1e-9);
+        assert!((rate_table_cost(&u45, true) - 0.30).abs() < 1e-9);
     }
 }

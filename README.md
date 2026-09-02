@@ -148,7 +148,7 @@ Grok CLI on that side picks up `auth.json` on the next API call. Refresh tokens 
 | `--root DIR` | Sessions root override |
 | `--json` | Machine-readable |
 | `--usage-only` | Hide empty sessions |
-| `-v` | Log$ + cache Saved$ |
+| `-v` | daily: cache Saved$ · session: project path |
 | `--no-color` | Disable colors |
 
 Data: `$GROK_DATA_DIR` → `$GROK_HOME/sessions` → `~/.grok/sessions`.
@@ -166,16 +166,17 @@ Data: `$GROK_DATA_DIR` → `$GROK_HOME/sessions` → `~/.grok/sessions`.
 | **Output** | Σ `outputTokens` |
 | **Total** | ≈ Input + Output |
 | **NoCache** | Fresh + Output |
-| **Cost** | Public list price + cache discount + long-context tier |
-| **Log$** (`-v`) | `costUsdTicks/1e9` (CLI internal) |
-| **Saved** (`-v`) | vs full-price input |
+| **Billing** | `costUsdTicks / 1e10` — CLI / SuperGrok receipt |
+| **API$** | Public list price on that row's token totals (200k 2× only when `modelCalls ≤ 1`) |
+| **Saved** (`-v`) | API$ vs billing all input at the full input rate |
 
 ```text
-fresh = input - cachedRead
-Cost  = fresh×input_rate + cached×cached_rate + output×output_rate
+fresh    = input - cachedRead
+Billing  = costUsdTicks / 1e10
+API$     = fresh×input_rate + cached×cached_rate + output×output_rate
 ```
 
-Rates follow [xAI pricing](https://docs.x.ai/developers/pricing) for grok-4.5 (and friends). Estimates only.
+A `turn_completed` row sums every API request in the turn, so API$ cannot place the 200k cliff per request. Rates follow [xAI pricing](https://docs.x.ai/developers/pricing).
 
 ---
 
