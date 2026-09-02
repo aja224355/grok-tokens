@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
+DEPRECATED. Use the Rust `grok-tokens` binary. This script is frozen and
+will be removed; new commands (including `account`) are Rust-only.
+
 grok-tokens — count real Grok Build usage tokens from local session logs.
 
-Pure Python 3 (stdlib only). Install once; no runtime deps.
+Pure Python 3 (stdlib only). Do not add features here.
 
 Unlike peak-context tools that sum cumulative _meta.totalTokens, this tool
 sums per-turn usage fields:
@@ -1185,6 +1188,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> int:
     global _USE_COLOR
+    print(
+        "warning: grok_tokens.py is deprecated; install the Rust binary "
+        "(./install.sh). This script will be removed.",
+        file=sys.stderr,
+    )
     parser = build_parser()
     args = parser.parse_args(argv)
 

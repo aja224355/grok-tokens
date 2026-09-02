@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# grok-tokens installer (dual-stack)
+# grok-tokens installer (Rust binary)
 #
 # Remote:
 #   curl -fsSL https://raw.githubusercontent.com/OWNER/grok-tokens/main/install.sh | bash
@@ -11,14 +11,12 @@
 # Preference order:
 #   1) Local cargo build (dev checkout)
 #   2) Prebuilt native binary from GitHub Releases (musl/gnu/mac)
-#   3) Pure Python script (stdlib only) as portable fallback
 #
 set -euo pipefail
 
 REPO_SLUG="${GROK_TOKENS_REPO:-alientek/grok-tokens}"
 INSTALL_DIR="${HOME}/.local/bin"
 BINARY_NAME="grok-tokens"
-SCRIPT_NAME="grok_tokens.py"
 
 echo "Installing grok-tokens..."
 mkdir -p "$INSTALL_DIR"
@@ -64,16 +62,11 @@ if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/Cargo.toml" ]]; then
     echo "Building release binary with cargo..."
     (cd "${SCRIPT_DIR}" && cargo build --release)
     install_file "${SCRIPT_DIR}/target/release/${BINARY_NAME}"
-  elif [[ -f "${SCRIPT_DIR}/${SCRIPT_NAME}" ]] && command -v python3 >/dev/null 2>&1; then
-    echo "No cargo — installing Python fallback launcher."
-    cat > "$DEST" <<EOF
-#!/usr/bin/env bash
-exec python3 "${SCRIPT_DIR}/${SCRIPT_NAME}" "\$@"
-EOF
-    chmod +x "$DEST" "${SCRIPT_DIR}/${SCRIPT_NAME}"
-    echo "Installed: ${DEST} (Python)"
   else
-    echo "Error: need cargo (for Rust) or python3 (for fallback)."
+    echo "Error: cargo is required to build from a local checkout."
+    echo "Install Rust: https://rustup.rs"
+    echo "Or install a release binary:"
+    echo "  curl -fsSL https://raw.githubusercontent.com/${REPO_SLUG}/main/install.sh | bash"
     exit 1
   fi
 
@@ -131,45 +124,8 @@ if [[ -n "$TARGET" ]]; then
   done
 fi
 
-# 2) Fallback: pure Python single-file asset (all platforms)
 if [[ "$download_ok" -ne 1 ]]; then
-  for name in "grok-tokens.py" "grok_tokens.py" "grok-tokens"; do
-    URL="https://github.com/${REPO_SLUG}/releases/download/${LATEST_TAG}/${name}"
-    echo "Trying Python asset ${URL} ..."
-    if curl -fsSL -o "$TMP" "$URL"; then
-      if head -1 "$TMP" | grep -q 'python' || grep -q 'inputTokens\|grok-tokens' "$TMP" 2>/dev/null; then
-        if ! head -1 "$TMP" | grep -q '^#!'; then
-          { echo '#!/usr/bin/env python3'; cat "$TMP"; } > "${TMP}.py"
-          mv "${TMP}.py" "$TMP"
-        fi
-        if command -v python3 >/dev/null 2>&1; then
-          install_file "$TMP"
-          download_ok=1
-          echo "(Python fallback)"
-        fi
-      fi
-    fi
-    [[ "$download_ok" -eq 1 ]] && break
-  done
-fi
-
-# 3) Fallback: raw main branch script
-if [[ "$download_ok" -ne 1 ]]; then
-  URL="https://raw.githubusercontent.com/${REPO_SLUG}/main/${SCRIPT_NAME}"
-  echo "Trying ${URL} ..."
-  if curl -fsSL -o "$TMP" "$URL" && command -v python3 >/dev/null 2>&1; then
-    if ! head -1 "$TMP" | grep -q '^#!'; then
-      { echo '#!/usr/bin/env python3'; cat "$TMP"; } > "${TMP}.py"
-      mv "${TMP}.py" "$TMP"
-    fi
-    install_file "$TMP"
-    download_ok=1
-    echo "(Python from main branch)"
-  fi
-fi
-
-if [[ "$download_ok" -ne 1 ]]; then
-  echo "Download failed for all strategies."
+  echo "Download failed: no native binary for this platform."
   echo "Manual options:"
   echo "  cargo install --git https://github.com/${REPO_SLUG} --locked"
   echo "  git clone https://github.com/${REPO_SLUG}.git && cd grok-tokens && ./install.sh"

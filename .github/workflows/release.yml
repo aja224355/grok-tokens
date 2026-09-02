@@ -5,7 +5,6 @@ name: Release
 #
 # Assets:
 #   grok-tokens-<triple>.tar.gz   native binaries (incl. linux musl)
-#   grok-tokens.py                pure-Python fallback (all platforms)
 
 on:
   push:
@@ -68,22 +67,8 @@ jobs:
           name: grok-tokens-${{ matrix.target }}
           path: grok-tokens-${{ matrix.target }}.tar.gz
 
-  python-asset:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Package Python fallback
-        run: |
-          cp grok_tokens.py grok-tokens.py
-          chmod +x grok-tokens.py
-          python3 grok-tokens.py --version
-      - uses: actions/upload-artifact@v4
-        with:
-          name: grok-tokens-python
-          path: grok-tokens.py
-
   release:
-    needs: [build, python-asset]
+    needs: [build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -103,6 +88,5 @@ jobs:
           generate_release_notes: true
           files: |
             dist/**/*.tar.gz
-            dist/**/grok-tokens.py
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

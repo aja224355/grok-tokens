@@ -1,8 +1,8 @@
 //! grok-tokens — real Grok Build usage tokens from local session logs.
 //!
-//! Pure native binary (no Python runtime). Parity with `grok_tokens.py`.
+//! Native Rust CLI. The Python script is deprecated and will be removed.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{TimeZone, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use regex::Regex;
@@ -11,7 +11,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, IsTerminal};
+use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use walkdir::WalkDir;
@@ -252,6 +252,43 @@ fn sessions_root() -> PathBuf {
         return p;
     }
     dirs_home().join(".grok").join("sessions")
+}
+
+fn auth_json_path() -> PathBuf {
+    if let Ok(p) = env::var("GROK_AUTH_PATH") {
+        let t = p.trim();
+        if !t.is_empty() {
+            return PathBuf::from(t);
+        }
+    }
+    grok_home().join("auth.json")
+}
+
+fn profiles_dir() -> PathBuf {
+    if let Ok(d) = env::var("GROK_TOKENS_PROFILES") {
+        let t = d.trim();
+        if !t.is_empty() {
+            return PathBuf::from(t);
+        }
+    }
+    if let Ok(xdg) = env::var("XDG_DATA_HOME") {
+        let t = xdg.trim();
+        if !t.is_empty() {
+            return PathBuf::from(t).join("grok-tokens").join("accounts");
+        }
+    }
+    #[cfg(windows)]
+    if let Ok(la) = env::var("LOCALAPPDATA") {
+        let t = la.trim();
+        if !t.is_empty() {
+            return PathBuf::from(t).join("grok-tokens").join("accounts");
+        }
+    }
+    dirs_home()
+        .join(".local")
+        .join("share")
+        .join("grok-tokens")
+        .join("accounts")
 }
 
 // ── Account limit (Weekly/Monthly — same as Grok /usage) ─────────────────
@@ -1144,6 +1181,594 @@ fn print_sessions(
     }
 }
 
+// ── Account profiles (local auth.json snapshots) ──────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+struct AuthIdentity {
+    email: Option<String>,
+    user_id: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
+    expires_at: Option<String>,
+    auth_mode: Option<String>,
+}
+
+impl AuthIdentity {
+    fn display_name(&self) -> Option<String> {
+        let first = self.first_name.as_deref().unwrap_or("").trim();
+        let last = self.last_name.as_deref().unwrap_or("").trim();
+        let s = format!("{first} {last}").trim().to_string();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+
+    fn as_public(&self) -> Value {
+        serde_json::json!({
+            "email": self.email,
+            "user_id": self.user_id,
+            "name": self.display_name(),
+            "expires_at": self.expires_at,
+            "auth_mode": self.auth_mode,
+        })
+    }
+}
+
+fn json_opt_str(obj: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    obj.get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+fn identity_from_auth(v: &Value) -> Option<AuthIdentity> {
+    let obj = v.as_object()?;
+    for (_scope, entry) in obj {
+        let Some(e) = entry.as_object() else {
+            continue;
+        };
+        if e.get("email").is_none() && e.get("user_id").is_none() && e.get("key").is_none() {
+            continue;
+        }
+        return Some(AuthIdentity {
+            email: json_opt_str(e, "email"),
+            user_id: json_opt_str(e, "user_id").or_else(|| json_opt_str(e, "principal_id")),
+            first_name: json_opt_str(e, "first_name"),
+            last_name: json_opt_str(e, "last_name"),
+            expires_at: json_opt_str(e, "expires_at"),
+            auth_mode: json_opt_str(e, "auth_mode"),
+        });
+    }
+    None
+}
+
+fn sanitize_stem(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+            out.push(c);
+        } else if matches!(c, '+' | ' ') {
+            out.push('-');
+        }
+    }
+    out.trim_matches(|c| c == '.' || c == '-').to_string()
+}
+
+fn default_profile_name(id: &AuthIdentity) -> String {
+    if let Some(email) = &id.email {
+        let local = email.split('@').next().unwrap_or(email);
+        let s = sanitize_stem(local);
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    if let Some(uid) = &id.user_id {
+        let s: String = uid
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(8)
+            .collect();
+        if !s.is_empty() {
+            return format!("user-{s}");
+        }
+    }
+    "default".into()
+}
+
+fn validate_profile_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 64 {
+        anyhow::bail!("profile name must be 1–64 characters");
+    }
+    if name == "." || name == ".." || name == "current" {
+        anyhow::bail!("invalid profile name: {name}");
+    }
+    if name.starts_with('.') {
+        anyhow::bail!("profile name must not start with '.'");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        anyhow::bail!("profile name may only contain A-Z a-z 0-9 . _ -");
+    }
+    Ok(())
+}
+
+fn profile_auth_path(name: &str) -> PathBuf {
+    profiles_dir().join(name).join("auth.json")
+}
+
+fn read_json(path: &Path) -> Result<Value> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("invalid JSON in {}", path.display()))
+}
+
+fn read_auth_file() -> Result<Option<Value>> {
+    let path = auth_json_path();
+    if !path.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(read_json(&path)?))
+}
+
+fn set_secret_perms(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    let _ = path;
+    Ok(())
+}
+
+fn write_secret_json(path: &Path, value: &Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut f = File::create(&tmp)
+            .with_context(|| format!("failed to create {}", tmp.display()))?;
+        serde_json::to_writer_pretty(&mut f, value)?;
+        f.write_all(b"\n")?;
+        f.sync_all()?;
+    }
+    set_secret_perms(&tmp)?;
+    fs::rename(&tmp, path).with_context(|| format!("failed to write {}", path.display()))?;
+    set_secret_perms(path)?;
+    Ok(())
+}
+
+fn read_current_profile() -> Result<Option<String>> {
+    let p = profiles_dir().join("current");
+    if !p.is_file() {
+        return Ok(None);
+    }
+    let s = fs::read_to_string(p)?;
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(s.to_string()))
+}
+
+fn write_current_profile(name: &str) -> Result<()> {
+    let dir = profiles_dir();
+    fs::create_dir_all(&dir)?;
+    fs::write(dir.join("current"), format!("{name}\n"))?;
+    Ok(())
+}
+
+fn clear_current_profile() -> Result<()> {
+    let p = profiles_dir().join("current");
+    if p.is_file() {
+        fs::remove_file(p)?;
+    }
+    Ok(())
+}
+
+fn list_profile_names() -> Result<Vec<String>> {
+    let dir = profiles_dir();
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut names = Vec::new();
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if validate_profile_name(&name).is_err() {
+            continue;
+        }
+        if entry.path().join("auth.json").is_file() {
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+fn persist_live_auth() -> Result<Option<String>> {
+    let live = match read_auth_file()? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let live_uid = identity_from_auth(&live).and_then(|i| i.user_id);
+
+    let mut candidates = Vec::new();
+    if let Some(cur) = read_current_profile()? {
+        candidates.push(cur);
+    }
+    for name in list_profile_names()? {
+        if !candidates.contains(&name) {
+            candidates.push(name);
+        }
+    }
+
+    for name in candidates {
+        let path = profile_auth_path(&name);
+        if !path.is_file() {
+            continue;
+        }
+        let stored = read_json(&path)?;
+        let stored_uid = identity_from_auth(&stored).and_then(|i| i.user_id);
+        match (live_uid.as_deref(), stored_uid.as_deref()) {
+            (Some(a), Some(b)) if a == b => {
+                write_secret_json(&path, &live)?;
+                return Ok(Some(name));
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+fn require_live_auth() -> Result<(Value, AuthIdentity)> {
+    let value = read_auth_file()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "not signed in (no {})\nRun: grok login",
+            auth_json_path().display()
+        )
+    })?;
+    let id = identity_from_auth(&value).ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not read account identity from {}",
+            auth_json_path().display()
+        )
+    })?;
+    Ok((value, id))
+}
+
+fn matching_profile(id: &AuthIdentity) -> Result<Option<String>> {
+    let uid = match &id.user_id {
+        Some(u) => u.clone(),
+        None => return Ok(read_current_profile()?),
+    };
+    if let Some(cur) = read_current_profile()? {
+        if let Ok(stored) = read_json(&profile_auth_path(&cur)) {
+            if identity_from_auth(&stored).and_then(|i| i.user_id) == Some(uid.clone()) {
+                return Ok(Some(cur));
+            }
+        }
+    }
+    for name in list_profile_names()? {
+        if let Ok(stored) = read_json(&profile_auth_path(&name)) {
+            if identity_from_auth(&stored).and_then(|i| i.user_id) == Some(uid.clone()) {
+                return Ok(Some(name));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn run_account(cmd: &AccountCmd, json: bool, color: bool) -> Result<()> {
+    match cmd {
+        AccountCmd::Whoami => account_whoami(json, color),
+        AccountCmd::Save { name } => account_save(name.as_deref(), json, color),
+        AccountCmd::List => account_list(json, color),
+        AccountCmd::Switch { name } => account_switch(name, json, color),
+        AccountCmd::Remove { name } => account_remove(name, json, color),
+    }
+}
+
+fn account_whoami(json: bool, color: bool) -> Result<()> {
+    let (_value, id) = require_live_auth()?;
+    let profile = matching_profile(&id)?;
+    if json {
+        let mut out = id.as_public();
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("logged_in".into(), Value::Bool(true));
+            obj.insert(
+                "profile".into(),
+                profile
+                    .clone()
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "auth_path".into(),
+                Value::String(auth_json_path().display().to_string()),
+            );
+        }
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+    println!(
+        "{}{}",
+        c(color, "1;36", "Grok account"),
+        profile
+            .as_deref()
+            .map(|p| format!("  ·  {}", c(color, "32", &format!("profile {p}"))))
+            .unwrap_or_default()
+    );
+    println!();
+    println!("  Email        {}", id.email.as_deref().unwrap_or("—"));
+    println!("  Name         {}", id.display_name().as_deref().unwrap_or("—"));
+    println!("  User ID      {}", id.user_id.as_deref().unwrap_or("—"));
+    println!("  Auth         {}", id.auth_mode.as_deref().unwrap_or("—"));
+    println!("  Expires      {}", id.expires_at.as_deref().unwrap_or("—"));
+    println!("  Auth file    {}", auth_json_path().display());
+    Ok(())
+}
+
+fn account_save(name: Option<&str>, json: bool, color: bool) -> Result<()> {
+    let (value, id) = require_live_auth()?;
+    let name = match name {
+        Some(n) => {
+            validate_profile_name(n)?;
+            n.to_string()
+        }
+        None => {
+            let n = default_profile_name(&id);
+            validate_profile_name(&n)?;
+            n
+        }
+    };
+    let dest = profile_auth_path(&name);
+    if dest.is_file() {
+        if let Ok(stored) = read_json(&dest) {
+            let stored_id = identity_from_auth(&stored);
+            let stored_uid = stored_id.as_ref().and_then(|s| s.user_id.clone());
+            if let (Some(a), Some(b)) = (id.user_id.as_deref(), stored_uid.as_deref()) {
+                if a != b {
+                    let other = stored_id
+                        .and_then(|s| s.email)
+                        .unwrap_or_else(|| b.to_string());
+                    anyhow::bail!(
+                        "profile '{name}' already belongs to {other}\nPick another name or: grok-tokens account remove {name}"
+                    );
+                }
+            }
+        }
+    }
+    write_secret_json(&dest, &value)?;
+    write_current_profile(&name)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "action": "save",
+                "name": name,
+                "email": id.email,
+                "user_id": id.user_id,
+                "path": dest.display().to_string(),
+            }))?
+        );
+        return Ok(());
+    }
+    println!(
+        "Saved profile {} ({})",
+        c(color, "1;32", &name),
+        id.email.as_deref().unwrap_or("unknown")
+    );
+    println!("{}", c(color, "2", &format!("  {}", dest.display())));
+    Ok(())
+}
+
+fn account_list(json: bool, color: bool) -> Result<()> {
+    let names = list_profile_names()?;
+    let live = read_auth_file().ok().flatten();
+    let live_id = live.as_ref().and_then(identity_from_auth);
+    let live_uid = live_id.as_ref().and_then(|i| i.user_id.clone());
+    let current = read_current_profile()?;
+
+    let mut rows_json = Vec::new();
+    for name in &names {
+        let stored = read_json(&profile_auth_path(name)).ok();
+        let id = stored.as_ref().and_then(identity_from_auth);
+        let active = match (live_uid.as_deref(), id.as_ref().and_then(|i| i.user_id.as_deref())) {
+            (Some(a), Some(b)) => a == b,
+            _ => current.as_deref() == Some(name.as_str()),
+        };
+        rows_json.push(serde_json::json!({
+            "name": name,
+            "email": id.as_ref().and_then(|i| i.email.clone()),
+            "user_id": id.as_ref().and_then(|i| i.user_id.clone()),
+            "name_display": id.as_ref().and_then(|i| i.display_name()),
+            "expires_at": id.as_ref().and_then(|i| i.expires_at.clone()),
+            "active": active,
+        }));
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "current": current,
+                "live": live_id.as_ref().map(|i| i.as_public()),
+                "profiles": rows_json,
+            }))?
+        );
+        return Ok(());
+    }
+
+    if names.is_empty() {
+        println!("{}", c(color, "33", "No saved profiles."));
+        println!(
+            "{}",
+            c(
+                color,
+                "2",
+                "Save the current login:  grok-tokens account save [name]"
+            )
+        );
+        return Ok(());
+    }
+
+    let headers = vec![
+        "".into(),
+        "Profile".into(),
+        "Email".into(),
+        "Expires".into(),
+    ];
+    let mut rows = Vec::new();
+    for item in &rows_json {
+        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let email = item
+            .get("email")
+            .and_then(|v| v.as_str())
+            .unwrap_or("—");
+        let exp = item
+            .get("expires_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("—");
+        let exp = if exp.len() >= 10 { &exp[..10] } else { exp };
+        let active = item.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+        let mark = if active {
+            c(color, "1;32", "*")
+        } else {
+            " ".into()
+        };
+        rows.push(vec![
+            mark,
+            if active {
+                c(color, "1;32", name)
+            } else {
+                name.into()
+            },
+            email.into(),
+            c(color, "2", exp),
+        ]);
+    }
+    print_table(&headers, &rows, color, false);
+    println!();
+    println!(
+        "{}",
+        c(
+            color,
+            "2",
+            &format!(
+                "{} profile{}  ·  * = matches current ~/.grok/auth.json  ·  {}",
+                names.len(),
+                if names.len() == 1 { "" } else { "s" },
+                profiles_dir().display()
+            )
+        )
+    );
+    Ok(())
+}
+
+fn account_switch(name: &str, json: bool, color: bool) -> Result<()> {
+    validate_profile_name(name)?;
+    let src = profile_auth_path(name);
+    if !src.is_file() {
+        anyhow::bail!(
+            "no profile '{name}'\nSaved: {}\nList:  grok-tokens account list",
+            list_profile_names()?.join(", ")
+        );
+    }
+    let incoming = read_json(&src)?;
+    let id = identity_from_auth(&incoming).ok_or_else(|| {
+        anyhow::anyhow!("profile '{name}' has no account identity")
+    })?;
+
+    let persisted = persist_live_auth()?;
+    write_secret_json(&auth_json_path(), &incoming)?;
+    write_current_profile(name)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "action": "switch",
+                "name": name,
+                "email": id.email,
+                "user_id": id.user_id,
+                "persisted": persisted,
+                "auth_path": auth_json_path().display().to_string(),
+            }))?
+        );
+        return Ok(());
+    }
+    if let Some(prev) = persisted.as_deref() {
+        if prev != name {
+            println!(
+                "{}",
+                c(color, "2", &format!("Updated snapshot for profile {prev}"))
+            );
+        }
+    }
+    println!(
+        "Switched to {} ({})",
+        c(color, "1;32", name),
+        id.email.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "{}",
+        c(
+            color,
+            "2",
+            "Grok picks this up on the next API call. Restart a running session if it does not."
+        )
+    );
+    Ok(())
+}
+
+fn account_remove(name: &str, json: bool, color: bool) -> Result<()> {
+    validate_profile_name(name)?;
+    let dir = profiles_dir().join(name);
+    let auth = dir.join("auth.json");
+    if !auth.is_file() {
+        anyhow::bail!("no profile '{name}'");
+    }
+    fs::remove_file(&auth)?;
+    if dir.is_dir() {
+        let _ = fs::remove_dir(&dir);
+    }
+    if read_current_profile()?.as_deref() == Some(name) {
+        clear_current_profile()?;
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "action": "remove",
+                "name": name,
+            }))?
+        );
+        return Ok(());
+    }
+    println!("Removed profile {}", c(color, "1;33", name));
+    println!(
+        "{}",
+        c(
+            color,
+            "2",
+            "Grok stays signed in; this only deletes the saved snapshot."
+        )
+    );
+    Ok(())
+}
+
 // ── CLI ───────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
@@ -1201,6 +1826,32 @@ enum Commands {
     },
     /// Account Weekly/Monthly limit (same source as Grok /usage)
     Limit,
+    /// Save / switch Grok login profiles (local auth.json snapshots)
+    Account {
+        #[command(subcommand)]
+        command: AccountCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AccountCmd {
+    /// Show the signed-in Grok account
+    Whoami,
+    /// Snapshot ~/.grok/auth.json as a named profile
+    Save {
+        /// Profile name (default: email local-part)
+        name: Option<String>,
+    },
+    /// List saved profiles
+    List,
+    /// Activate a saved profile (replaces auth.json)
+    Switch {
+        name: String,
+    },
+    /// Delete a saved profile (does not log out of Grok)
+    Remove {
+        name: String,
+    },
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, Default)]
@@ -1297,6 +1948,11 @@ fn print_limit_detail(limit: Option<&AccountLimit>, json: bool, color: bool) {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let color = use_color(cli.no_color);
+
+    if let Commands::Account { command } = &cli.command {
+        return run_account(command, cli.json, color);
+    }
+
     let account_limit = load_account_limit(4_000_000);
 
     if matches!(cli.command, Commands::Limit) {
@@ -1370,7 +2026,45 @@ fn main() -> Result<()> {
             );
         }
         Commands::Limit => unreachable!(),
+        Commands::Account { .. } => unreachable!(),
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn profile_name_rules() {
+        assert!(validate_profile_name("work").is_ok());
+        assert!(validate_profile_name("huhan.ken").is_ok());
+        assert!(validate_profile_name("user-4b8c12c2").is_ok());
+        assert!(validate_profile_name("..").is_err());
+        assert!(validate_profile_name("current").is_err());
+        assert!(validate_profile_name("foo/bar").is_err());
+        assert!(validate_profile_name(".hidden").is_err());
+    }
+
+    #[test]
+    fn identity_parses_oidc_blob() {
+        let v = json!({
+            "https://auth.x.ai::abc": {
+                "email": "a@b.com",
+                "user_id": "uid-1",
+                "first_name": "Ada",
+                "last_name": "Lovelace",
+                "expires_at": "2026-01-01T00:00:00Z",
+                "auth_mode": "oidc",
+                "key": "secret-must-not-be-required-for-identity"
+            }
+        });
+        let id = identity_from_auth(&v).unwrap();
+        assert_eq!(id.email.as_deref(), Some("a@b.com"));
+        assert_eq!(id.user_id.as_deref(), Some("uid-1"));
+        assert_eq!(id.display_name().as_deref(), Some("Ada Lovelace"));
+        assert_eq!(default_profile_name(&id), "a");
+    }
 }

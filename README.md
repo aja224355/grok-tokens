@@ -2,15 +2,10 @@
 
 **Grok Build token usage CLI** — accurate per-turn totals from local session logs.
 
-Native **Rust** binary (preferred) + **pure Python** fallback.  
+Native **Rust** binary. musl Linux builds avoid glibc issues.  
 Inspired by the install UX of [grok-usage](https://github.com/simnova/grok-usage).
 
-| Stack | Role |
-|-------|------|
-| **Rust** | Default executable — no interpreter, musl Linux builds avoid glibc issues |
-| **Python 3.8+** | Portable fallback (`grok_tokens.py`, stdlib only) |
-
-Same CLI surface and metrics on both implementations.
+`grok_tokens.py` is **deprecated** (no new features; will be removed). Use the Rust binary.
 
 ---
 
@@ -41,7 +36,6 @@ grok-tokens daily
 2. Else **GitHub Release** → download `grok-tokens-<target>.tar.gz`  
    - Linux: **`x86_64-unknown-linux-musl`** / `aarch64-unknown-linux-musl` (static-friendly)
    - macOS: `aarch64-apple-darwin` / `x86_64-apple-darwin`
-3. Else **Python** asset / raw `grok_tokens.py` from `main`
 
 ### Manual
 
@@ -54,9 +48,6 @@ git clone https://github.com/alientek/grok-tokens.git
 cd grok-tokens
 cargo build --release
 ./install.sh
-
-# Python only
-python3 grok_tokens.py daily
 ```
 
 ---
@@ -74,9 +65,34 @@ grok-tokens session --sort recent
 
 # Account quota (same as Grok CLI /usage "Weekly limit: 24%")
 grok-tokens limit
+
+# Local login profiles (Grok CLI itself has no multi-account switch)
+grok-tokens account whoami
+grok-tokens account save              # name = email local-part
+grok-tokens account save work
+grok-tokens account list
+grok-tokens account switch work
 ```
 
 Account limit is read from `~/.grok/logs/unified.jsonl` (`billing: fetched credits config`), which the Grok CLI refreshes while sessions run. It is **not** derived from local token sums.
+
+### Account profiles
+
+Grok stores a single login in `~/.grok/auth.json`. `account` snapshots that file as named profiles (like `gcloud auth` / AWS profiles):
+
+| Command | Action |
+|---------|--------|
+| `account whoami` | Current `email` / `user_id` |
+| `account save [name]` | Copy live `auth.json` to a profile |
+| `account list` | Saved profiles (`*` = matches live login) |
+| `account switch <name>` | Atomically replace `auth.json` |
+| `account remove <name>` | Delete a snapshot (does not log out) |
+
+Profiles: `$GROK_TOKENS_PROFILES` → `$XDG_DATA_HOME/grok-tokens/accounts` → `~/.local/share/grok-tokens/accounts`. Auth file: `$GROK_AUTH_PATH` → `$GROK_HOME/auth.json` → `~/.grok/auth.json`.
+
+`switch` first writes the live login back to the matching profile (so refreshed tokens are not lost). Grok picks up the new file on the next API call; restart a running session if it does not.
+
+Do **not** copy profile directories into git or chat — they contain refresh tokens.
 
 
 | Flag | Description |
@@ -118,21 +134,19 @@ Rates follow [xAI pricing](https://docs.x.ai/developers/pricing) for grok-4.5 (a
 
 ---
 
-## Why Rust + Python
+## Why Rust
 
-- **Rust musl**: one static-friendly Linux binary — avoids the “prebuilt needs GLIBC 2.3x” trap.
-- **Python fallback**: any machine with `python3`, no compiler.
-- **Same numbers**: both read `usage.*` the same way.
+**musl** Linux binaries are static-friendly — avoids the “prebuilt needs GLIBC 2.3x” trap. One executable, no interpreter.
 
 ---
 
 ## Publish (maintainers)
 
 ```bash
-# bump version in Cargo.toml + grok_tokens.py __version__
+# bump version in Cargo.toml
 git tag v0.1.0
 git push origin v0.1.0
-# Actions builds musl/gnu/mac tarballs + grok-tokens.py and attaches to the Release
+# Actions builds musl/gnu/mac tarballs and attaches them to the Release
 ```
 
 ---
@@ -142,16 +156,15 @@ git push origin v0.1.0
 ```bash
 cargo run -- daily --no-color
 cargo run -- session --usage-only
-python3 grok_tokens.py daily --no-color   # parity check
 cargo build --release
 ./install.sh
 ```
 
 ```text
 src/main.rs           # Rust CLI
-grok_tokens.py        # Python fallback (parity)
-install.sh            # dual-stack installer
+install.sh            # installer (native binary)
 .github/workflows/    # CI + multi-target release
+grok_tokens.py        # deprecated; do not extend
 ```
 
 ## License
