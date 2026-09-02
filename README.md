@@ -89,12 +89,34 @@ Grok stores a single login in `~/.grok/auth.json`. `account` snapshots that file
 | `account list` | Saved profiles (`*` = matches live login) |
 | `account switch <name>` | Atomically replace `auth.json` |
 | `account remove <name>` | Delete a snapshot (does not log out) |
+| `account export [name] -o FILE` | Write a portable file (auth + metadata) |
+| `account import FILE [--name] [--no-switch]` | Load that file; default also replaces live `auth.json` |
 
 Profiles: `$GROK_TOKENS_PROFILES` → `$XDG_DATA_HOME/grok-tokens/accounts` → `~/.local/share/grok-tokens/accounts`. Auth file: `$GROK_AUTH_PATH` → `$GROK_HOME/auth.json` → `~/.grok/auth.json`.
 
 `switch` first writes the live login back to the matching profile (so refreshed tokens are not lost). Grok picks up the new file on the next API call; restart a running session if it does not.
 
-Do **not** copy profile directories into git or chat — they contain refresh tokens.
+Do **not** copy profile directories or export files into git or chat — they contain refresh tokens.
+
+### WSL ↔ Windows (no re-login)
+
+Export on the side that is already signed in, copy the file, import on the other. Same file also works as raw `auth.json`.
+
+```bash
+# In WSL (already logged in)
+grok-tokens account export -o /mnt/c/Users/YOU/grok-account.json
+
+# Point at the Windows Grok home and import (still from WSL — no Win32 binary needed)
+GROK_HOME="/mnt/c/Users/YOU/.grok" grok-tokens account import /mnt/c/Users/YOU/grok-account.json
+```
+
+Or copy the file to Windows and, after a native `grok-tokens.exe` exists:
+
+```powershell
+grok-tokens account import $env:USERPROFILE\grok-account.json
+```
+
+Grok CLI on that side picks up `auth.json` on the next API call. Refresh tokens expire; if import is rejected, run `grok login` once on that side.
 
 
 | Flag | Description |

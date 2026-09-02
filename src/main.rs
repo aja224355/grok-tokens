@@ -1763,6 +1763,12 @@ fn run_account(cmd: &AccountCmd, json: bool, color: bool) -> Result<()> {
         AccountCmd::List => account_list(json, color),
         AccountCmd::Switch { name } => account_switch(name, json, color),
         AccountCmd::Remove { name } => account_remove(name, json, color),
+        AccountCmd::Export { name, out } => account_export(name.as_deref(), out.as_deref(), json, color),
+        AccountCmd::Import {
+            file,
+            name,
+            no_switch,
+        } => account_import(file, name.as_deref(), *no_switch, json, color),
     }
 }
 
@@ -2074,6 +2080,223 @@ fn account_remove(name: &str, json: bool, color: bool) -> Result<()> {
     Ok(())
 }
 
+const ACCOUNT_BUNDLE_FORMAT: &str = "grok-tokens-account";
+
+fn parse_account_bundle(v: &Value) -> Result<(Value, Option<String>)> {
+    if v.get("format").and_then(|x| x.as_str()) == Some(ACCOUNT_BUNDLE_FORMAT) {
+        let auth = v
+            .get("auth")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("export file is missing auth"))?;
+        if identity_from_auth(&auth).is_none() {
+            anyhow::bail!("export file auth has no account identity");
+        }
+        let name = v
+            .get("name")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        return Ok((auth, name));
+    }
+    if identity_from_auth(v).is_some() {
+        return Ok((v.clone(), None));
+    }
+    anyhow::bail!("file is not a grok-tokens export or Grok auth.json")
+}
+
+fn account_export(
+    name: Option<&str>,
+    out: Option<&Path>,
+    json: bool,
+    color: bool,
+) -> Result<()> {
+    let _ = persist_live_auth();
+    let (auth, id, profile_name) = if let Some(n) = name {
+        validate_profile_name(n)?;
+        let path = profile_auth_path(n);
+        if !path.is_file() {
+            anyhow::bail!("no profile '{n}' — save it first: grok-tokens account save {n}");
+        }
+        let auth = read_json(&path)?;
+        let id = identity_from_auth(&auth)
+            .ok_or_else(|| anyhow::anyhow!("profile '{n}' has no account identity"))?;
+        (auth, id, n.to_string())
+    } else {
+        let (auth, id) = require_live_auth()?;
+        let n = matching_profile(&id)?.unwrap_or_else(|| default_profile_name(&id));
+        (auth, id, n)
+    };
+
+    let out = match out {
+        Some(p) if p.as_os_str() == "-" => {
+            anyhow::bail!("refusing to write credentials to stdout; pass --out FILE")
+        }
+        Some(p) => p.to_path_buf(),
+        None => PathBuf::from(format!("grok-account-{profile_name}.json")),
+    };
+
+    let bundle = serde_json::json!({
+        "format": ACCOUNT_BUNDLE_FORMAT,
+        "version": 1,
+        "exported_at": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "name": profile_name,
+        "email": id.email,
+        "user_id": id.user_id,
+        "auth": auth,
+        "limit": read_profile_limit(&profile_name).map(|l| l.as_public()),
+    });
+    write_secret_json(&out, &bundle)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "action": "export",
+                "name": profile_name,
+                "email": id.email,
+                "user_id": id.user_id,
+                "path": out.display().to_string(),
+            }))?
+        );
+        return Ok(());
+    }
+    println!(
+        "Exported {} ({}) → {}",
+        c(color, "1;32", &profile_name),
+        id.email.as_deref().unwrap_or("unknown"),
+        out.display()
+    );
+    println!(
+        "{}",
+        c(
+            color,
+            "33",
+            "Contains a refresh token. Do not git-commit, chat, or email this file."
+        )
+    );
+    println!(
+        "{}",
+        c(
+            color,
+            "2",
+            "On the other side:  grok-tokens account import <file>"
+        )
+    );
+    Ok(())
+}
+
+fn account_import(
+    file: &Path,
+    name: Option<&str>,
+    no_switch: bool,
+    json: bool,
+    color: bool,
+) -> Result<()> {
+    let raw = read_json(file)?;
+    let (auth, bundle_name) = parse_account_bundle(&raw)?;
+    let id = identity_from_auth(&auth)
+        .ok_or_else(|| anyhow::anyhow!("import file has no account identity"))?;
+
+    let name = match name {
+        Some(n) => {
+            validate_profile_name(n)?;
+            n.to_string()
+        }
+        None => {
+            let n = bundle_name.unwrap_or_else(|| default_profile_name(&id));
+            validate_profile_name(&n)?;
+            n
+        }
+    };
+
+    let dest = profile_auth_path(&name);
+    if dest.is_file() {
+        if let Ok(stored) = read_json(&dest) {
+            let stored_id = identity_from_auth(&stored);
+            let stored_uid = stored_id.as_ref().and_then(|s| s.user_id.clone());
+            if let (Some(a), Some(b)) = (id.user_id.as_deref(), stored_uid.as_deref()) {
+                if a != b {
+                    let other = stored_id
+                        .and_then(|s| s.email)
+                        .unwrap_or_else(|| b.to_string());
+                    anyhow::bail!(
+                        "profile '{name}' already belongs to {other}\nPick --name or: grok-tokens account remove {name}"
+                    );
+                }
+            }
+        }
+    }
+
+    if !no_switch {
+        let _ = persist_live_auth();
+    }
+    write_secret_json(&dest, &auth)?;
+    if let Some(limit_v) = raw.get("limit") {
+        if let Some(mut limit) = account_limit_from_stored(limit_v) {
+            limit.email = id.email.clone();
+            limit.user_id = id.user_id.clone();
+            limit.profile = Some(name.clone());
+            let _ = write_profile_limit(&name, &limit);
+        }
+    }
+    write_current_profile(&name)?;
+    if !no_switch {
+        write_secret_json(&auth_json_path(), &auth)?;
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "action": "import",
+                "name": name,
+                "email": id.email,
+                "user_id": id.user_id,
+                "switched": !no_switch,
+                "profile_path": dest.display().to_string(),
+                "auth_path": auth_json_path().display().to_string(),
+            }))?
+        );
+        return Ok(());
+    }
+    println!(
+        "Imported {} ({})",
+        c(color, "1;32", &name),
+        id.email.as_deref().unwrap_or("unknown")
+    );
+    if no_switch {
+        println!(
+            "{}",
+            c(
+                color,
+                "2",
+                &format!("Saved profile only. Switch later:  grok-tokens account switch {name}")
+            )
+        );
+    } else {
+        println!(
+            "{}",
+            c(
+                color,
+                "2",
+                &format!("Wrote live login:  {}", auth_json_path().display())
+            )
+        );
+        println!(
+            "{}",
+            c(
+                color,
+                "2",
+                "Grok picks this up on the next API call. Restart a running session if it does not."
+            )
+        );
+    }
+    Ok(())
+}
+
 // ── CLI ───────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
@@ -2156,6 +2379,25 @@ enum AccountCmd {
     /// Delete a saved profile (does not log out of Grok)
     Remove {
         name: String,
+    },
+    /// Write a portable account file (for WSL ↔ Windows)
+    Export {
+        /// Profile to export (default: current login)
+        name: Option<String>,
+        /// Output file (default: grok-account-<name>.json)
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+    /// Load a file from `account export` (or raw auth.json)
+    Import {
+        /// Exported bundle or ~/.grok/auth.json
+        file: PathBuf,
+        /// Profile name (default: name in file, else email local-part)
+        #[arg(long)]
+        name: Option<String>,
+        /// Save profile only; do not replace live auth.json
+        #[arg(long)]
+        no_switch: bool,
     },
 }
 
@@ -2374,5 +2616,30 @@ mod tests {
         assert_eq!(id.user_id.as_deref(), Some("uid-1"));
         assert_eq!(id.display_name().as_deref(), Some("Ada Lovelace"));
         assert_eq!(default_profile_name(&id), "a");
+    }
+
+    #[test]
+    fn parse_bundle_and_raw_auth() {
+        let auth = json!({
+            "https://auth.x.ai::abc": {
+                "email": "a@b.com",
+                "user_id": "uid-1"
+            }
+        });
+        let bundle = json!({
+            "format": "grok-tokens-account",
+            "version": 1,
+            "name": "work",
+            "auth": auth
+        });
+        let (got, name) = parse_account_bundle(&bundle).unwrap();
+        assert_eq!(name.as_deref(), Some("work"));
+        assert_eq!(identity_from_auth(&got).unwrap().email.as_deref(), Some("a@b.com"));
+
+        let (raw, raw_name) = parse_account_bundle(&auth).unwrap();
+        assert!(raw_name.is_none());
+        assert_eq!(identity_from_auth(&raw).unwrap().user_id.as_deref(), Some("uid-1"));
+
+        assert!(parse_account_bundle(&json!({"hello": 1})).is_err());
     }
 }
