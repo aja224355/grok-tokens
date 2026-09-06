@@ -9,20 +9,29 @@ Inspired by the install UX of [grok-usage](https://github.com/simnova/grok-usage
 
 ---
 
-## Install (one line)
+## Install (other computers)
+
+No Rust, no git clone. The installer downloads a native binary from GitHub Releases.
+
+**Linux / macOS / WSL:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aja224355/grok-tokens/main/install.sh | bash
+curl -fsSL https://github.com/aja224355/grok-tokens/releases/latest/download/install.sh | sh
 ```
 
-That downloads the latest GitHub Release binary (`grok-tokens-<target>.tar.gz`) into `~/.local/bin/grok-tokens`. No Rust toolchain required.
-
-Override repo (env vars must be on the `bash` side of the pipe):
+If `raw.githubusercontent.com` works better on that machine:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yourname/grok-tokens/main/install.sh \
-  | GROK_TOKENS_REPO=yourname/grok-tokens bash
+curl -fsSL https://cdn.jsdelivr.net/gh/aja224355/grok-tokens@main/install.sh | sh
 ```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://github.com/aja224355/grok-tokens/releases/latest/download/install.ps1 | iex
+```
+
+Installs to `~/.local/bin/grok-tokens` (Unix) or `%LOCALAPPDATA%\grok-tokens\grok-tokens.exe` (Windows). The script retries public GitHub mirrors if github.com is slow.
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
@@ -30,16 +39,26 @@ grok-tokens --version
 grok-tokens daily
 ```
 
-### What install.sh does
+Env vars must be on the **right** side of the pipe:
 
-1. **`curl | bash`** → GitHub Release asset for this OS/arch  
+```bash
+curl -fsSL https://github.com/aja224355/grok-tokens/releases/latest/download/install.sh \
+  | GROK_TOKENS_REPO=yourname/grok-tokens sh
+```
+
+### What the installer does
+
+1. **`curl | sh` / `irm | iex`** → GitHub Release asset for this OS/arch  
    - Linux: **`x86_64-unknown-linux-musl`** / `aarch64-unknown-linux-musl` (gnu fallback)
    - macOS: `aarch64-apple-darwin` / `x86_64-apple-darwin`
+   - Windows: `x86_64-pc-windows-msvc`
 2. **`./install.sh` in a clone** → `cargo build --release` (or existing `target/release`)
 
 Force a Release download from a clone: `GROK_TOKENS_FORCE_DOWNLOAD=1 ./install.sh`
 
 ### Manual
+
+Download a tarball from [Releases](https://github.com/aja224355/grok-tokens/releases/latest) and copy `grok-tokens` onto `PATH`.
 
 ```bash
 # Rust (from source)
@@ -112,7 +131,7 @@ grok-tokens account export -o /mnt/c/Users/YOU/grok-account.json
 GROK_HOME="/mnt/c/Users/YOU/.grok" grok-tokens account import /mnt/c/Users/YOU/grok-account.json
 ```
 
-Or copy the file to Windows and, after a native `grok-tokens.exe` exists:
+Or copy the file to Windows and import with the native binary:
 
 ```powershell
 grok-tokens account import $env:USERPROFILE\grok-account.json
@@ -170,9 +189,9 @@ Rates follow [xAI pricing](https://docs.x.ai/developers/pricing) for grok-4.5 (a
 
 ```bash
 # bump version in Cargo.toml
-git tag v0.1.0
-git push origin v0.1.0
-# Actions builds musl/gnu/mac tarballs and attaches them to the Release
+git tag v0.1.1
+git push origin v0.1.1
+# Actions builds linux/mac/windows tarballs and attaches install.sh + install.ps1
 ```
 
 ---
@@ -188,7 +207,8 @@ cargo build --release
 
 ```text
 src/main.rs           # Rust CLI
-install.sh            # installer (native binary)
+install.sh            # Unix installer (curl | sh)
+install.ps1           # Windows installer (irm | iex)
 .github/workflows/    # CI + multi-target release
 grok_tokens.py        # deprecated; do not extend
 ```
