@@ -1,28 +1,23 @@
 #!/usr/bin/env bash
 #
-# grok-tokens installer (Rust binary)
+# grok-tokens installer — download a native binary from GitHub Releases.
 #
-# Remote:
-#   curl -fsSL https://raw.githubusercontent.com/OWNER/grok-tokens/main/install.sh | bash
+# One-liner:
+#   curl -fsSL https://raw.githubusercontent.com/aja224355/grok-tokens/main/install.sh | bash
 #
-# Local checkout:
+# Local checkout (optional, skipped when piped through curl):
 #   ./install.sh
-#
-# Preference order:
-#   1) Local cargo build (dev checkout)
-#   2) Prebuilt native binary from GitHub Releases (musl/gnu/mac)
 #
 set -euo pipefail
 
-REPO_SLUG="${GROK_TOKENS_REPO:-alientek/grok-tokens}"
-INSTALL_DIR="${HOME}/.local/bin"
+REPO_SLUG="${GROK_TOKENS_REPO:-aja224355/grok-tokens}"
+INSTALL_DIR="${GROK_TOKENS_INSTALL_DIR:-${HOME}/.local/bin}"
 BINARY_NAME="grok-tokens"
 
 echo "Installing grok-tokens..."
 mkdir -p "$INSTALL_DIR"
 DEST="${INSTALL_DIR}/${BINARY_NAME}"
 
-# ── helpers ──────────────────────────────────────────────────────────────
 need_curl() {
   command -v curl >/dev/null 2>&1 || {
     echo "Error: curl is required."
@@ -30,18 +25,45 @@ need_curl() {
   }
 }
 
-detect_target() {
+# curl | bash lands BASH_SOURCE at /dev/fd/N (or empty). Never treat CWD as a
+# checkout in that case — otherwise a clone directory would cargo-build instead
+# of downloading the release binary.
+is_piped_install() {
+  local src="${BASH_SOURCE[0]:-}"
+  [[ -z "$src" || "$src" == "-" || "$src" == /dev/fd/* || "$src" == /proc/self/fd/* ]]
+}
+
+# Preferred target first, then a glibc fallback for Linux.
+detect_targets() {
   local os arch
   os=$(uname -s | tr '[:upper:]' '[:lower:]')
   arch=$(uname -m)
   case "$os-$arch" in
-    linux-x86_64|linux-amd64)   echo "x86_64-unknown-linux-musl" ;;
-    linux-aarch64|linux-arm64)  echo "aarch64-unknown-linux-musl" ;;
-    darwin-arm64|darwin-aarch64) echo "aarch64-apple-darwin" ;;
-    darwin-x86_64)              echo "x86_64-apple-darwin" ;;
-    # glibc fallback names (older releases)
-    *) echo "" ;;
+    linux-x86_64|linux-amd64)
+      echo "x86_64-unknown-linux-musl"
+      echo "x86_64-unknown-linux-gnu"
+      ;;
+    linux-aarch64|linux-arm64)
+      echo "aarch64-unknown-linux-musl"
+      echo "aarch64-unknown-linux-gnu"
+      ;;
+    darwin-arm64|darwin-aarch64)
+      echo "aarch64-apple-darwin"
+      ;;
+    darwin-x86_64)
+      echo "x86_64-apple-darwin"
+      ;;
+    *)
+      return 1
+      ;;
   esac
+}
+
+looks_like_binary() {
+  local path="$1"
+  local magic
+  magic="$(head -c 4 "$path" 2>/dev/null || true)"
+  [[ "$magic" == $'\x7fELF' || "$magic" == $'\xcf\xfa\xed\xfe' || "$magic" == $'\xfe\xed\xfa\xce' || "$magic" == $'\xfe\xed\xfa\xcf' ]]
 }
 
 install_file() {
@@ -50,89 +72,104 @@ install_file() {
   echo "Installed: ${DEST}"
 }
 
-# ── Mode A: local git checkout ───────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
-if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/Cargo.toml" ]]; then
+finish() {
+  echo ""
+  echo "Add to PATH if needed:  export PATH=\"\$HOME/.local/bin:\$PATH\""
+  echo "Verify:  grok-tokens --version && grok-tokens daily"
+}
+
+# ── Mode A: real file next to Cargo.toml (git clone / ./install.sh) ──────
+SCRIPT_DIR=""
+if ! is_piped_install && [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+
+if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/Cargo.toml" && -z "${GROK_TOKENS_FORCE_DOWNLOAD:-}" ]]; then
   echo "Local checkout detected: ${SCRIPT_DIR}"
 
-  # Prefer release binary if present or cargo available
   if [[ -x "${SCRIPT_DIR}/target/release/${BINARY_NAME}" ]]; then
     install_file "${SCRIPT_DIR}/target/release/${BINARY_NAME}"
+    finish
+    exit 0
   elif command -v cargo >/dev/null 2>&1; then
     echo "Building release binary with cargo..."
     (cd "${SCRIPT_DIR}" && cargo build --release)
     install_file "${SCRIPT_DIR}/target/release/${BINARY_NAME}"
+    finish
+    exit 0
   else
-    echo "Error: cargo is required to build from a local checkout."
-    echo "Install Rust: https://rustup.rs"
-    echo "Or install a release binary:"
-    echo "  curl -fsSL https://raw.githubusercontent.com/${REPO_SLUG}/main/install.sh | bash"
-    exit 1
+    echo "No cargo / local binary — falling back to GitHub Release download."
   fi
-
-  echo ""
-  echo "Add to PATH if needed:  export PATH=\"\$HOME/.local/bin:\$PATH\""
-  echo "Verify:  grok-tokens --version && grok-tokens daily"
-  exit 0
 fi
 
-# ── Mode B: remote install ───────────────────────────────────────────────
+# ── Mode B: GitHub Release binary ────────────────────────────────────────
 need_curl
-TARGET="$(detect_target)"
-TMP="$(mktemp)"
-trap 'rm -f "$TMP" "$TMP.tgz"' EXIT
 
-LATEST_TAG=$(
-  curl -fsSL "https://api.github.com/repos/${REPO_SLUG}/releases/latest" 2>/dev/null \
-    | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | head -1 || true
-)
-[[ -z "${LATEST_TAG}" ]] && LATEST_TAG="v0.1.0"
+TARGETS=()
+while IFS= read -r target; do
+  TARGETS+=("$target")
+done < <(detect_targets) || true
+if [[ ${#TARGETS[@]} -eq 0 ]]; then
+  echo "Error: unsupported platform: $(uname -s) $(uname -m)"
+  exit 1
+fi
+
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+ARCHIVE="${TMP_DIR}/grok-tokens.tar.gz"
+EXTRACT_DIR="${TMP_DIR}/extract"
 
 download_ok=0
 
-# 1) Preferred: musl/native tarball  grok-tokens-<target>.tar.gz
-if [[ -n "$TARGET" ]]; then
-  for name in \
-    "grok-tokens-${TARGET}.tar.gz" \
-    "grok-tokens-${TARGET}"
-  do
-    URL="https://github.com/${REPO_SLUG}/releases/download/${LATEST_TAG}/${name}"
-    echo "Trying ${URL} ..."
-    if curl -fsSL -o "$TMP" "$URL"; then
-      if [[ "$name" == *.tar.gz ]]; then
-        mkdir -p "${TMP}.dir"
-        if tar -xzf "$TMP" -C "${TMP}.dir" 2>/dev/null; then
-          BIN=$(find "${TMP}.dir" -type f -name "${BINARY_NAME}" | head -1)
-          if [[ -n "$BIN" && -f "$BIN" ]]; then
-            install_file "$BIN"
-            download_ok=1
-          fi
-        fi
-        rm -rf "${TMP}.dir"
-      else
-        # raw binary
-        if file "$TMP" 2>/dev/null | grep -qiE 'executable|ELF|Mach-O' \
-          || head -c 4 "$TMP" | grep -q $'\x7fELF' \
-          || head -c 4 "$TMP" | grep -q $'\xcf\xfa\xed\xfe'; then
-          install_file "$TMP"
-          download_ok=1
-        fi
-      fi
+try_url() {
+  local url="$1"
+  echo "Trying ${url} ..."
+  if ! curl -fsSL -o "$ARCHIVE" "$url"; then
+    return 1
+  fi
+
+  if [[ "$url" == *.tar.gz ]]; then
+    mkdir -p "$EXTRACT_DIR"
+    rm -rf "${EXTRACT_DIR:?}/"*
+    if ! tar -xzf "$ARCHIVE" -C "$EXTRACT_DIR" 2>/dev/null; then
+      return 1
     fi
-    [[ "$download_ok" -eq 1 ]] && break
+    local bin
+    bin="$(find "$EXTRACT_DIR" -type f -name "${BINARY_NAME}" | head -1)"
+    if [[ -n "$bin" && -f "$bin" ]]; then
+      install_file "$bin"
+      return 0
+    fi
+    return 1
+  fi
+
+  if looks_like_binary "$ARCHIVE"; then
+    install_file "$ARCHIVE"
+    return 0
+  fi
+  return 1
+}
+
+# /releases/latest/download follows the newest tag without calling the API.
+for target in "${TARGETS[@]}"; do
+  for name in \
+    "grok-tokens-${target}.tar.gz" \
+    "grok-tokens-${target}"
+  do
+    if try_url "https://github.com/${REPO_SLUG}/releases/latest/download/${name}"; then
+      download_ok=1
+      break 2
+    fi
   done
-fi
+done
 
 if [[ "$download_ok" -ne 1 ]]; then
   echo "Download failed: no native binary for this platform."
-  echo "Manual options:"
+  echo "Wait for the GitHub Release assets, or build from source:"
   echo "  cargo install --git https://github.com/${REPO_SLUG} --locked"
   echo "  git clone https://github.com/${REPO_SLUG}.git && cd grok-tokens && ./install.sh"
   exit 1
 fi
 
-echo ""
-echo "Add to PATH if needed:  export PATH=\"\$HOME/.local/bin:\$PATH\""
-echo "Verify:  grok-tokens --version && grok-tokens daily"
+finish
 echo "Done."

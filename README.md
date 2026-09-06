@@ -12,8 +12,10 @@ Inspired by the install UX of [grok-usage](https://github.com/simnova/grok-usage
 ## Install (one line)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/alientek/grok-tokens/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/aja224355/grok-tokens/main/install.sh | bash
 ```
+
+That downloads the latest GitHub Release binary (`grok-tokens-<target>.tar.gz`) into `~/.local/bin/grok-tokens`. No Rust toolchain required.
 
 Override repo:
 
@@ -21,8 +23,6 @@ Override repo:
 GROK_TOKENS_REPO=yourname/grok-tokens \
   curl -fsSL https://raw.githubusercontent.com/yourname/grok-tokens/main/install.sh | bash
 ```
-
-Installs to `~/.local/bin/grok-tokens`.
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
@@ -32,19 +32,21 @@ grok-tokens daily
 
 ### What install.sh does
 
-1. **Checkout present** → `cargo build --release` (or use existing `target/release`)
-2. Else **GitHub Release** → download `grok-tokens-<target>.tar.gz`  
-   - Linux: **`x86_64-unknown-linux-musl`** / `aarch64-unknown-linux-musl` (static-friendly)
+1. **`curl | bash`** → GitHub Release asset for this OS/arch  
+   - Linux: **`x86_64-unknown-linux-musl`** / `aarch64-unknown-linux-musl` (gnu fallback)
    - macOS: `aarch64-apple-darwin` / `x86_64-apple-darwin`
+2. **`./install.sh` in a clone** → `cargo build --release` (or existing `target/release`)
+
+Force a Release download from a clone: `GROK_TOKENS_FORCE_DOWNLOAD=1 ./install.sh`
 
 ### Manual
 
 ```bash
 # Rust (from source)
-cargo install --git https://github.com/alientek/grok-tokens --locked
+cargo install --git https://github.com/aja224355/grok-tokens --locked
 
 # Or clone
-git clone https://github.com/alientek/grok-tokens.git
+git clone https://github.com/aja224355/grok-tokens.git
 cd grok-tokens
 cargo build --release
 ./install.sh
