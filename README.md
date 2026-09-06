@@ -17,11 +17,11 @@ curl -fsSL https://raw.githubusercontent.com/aja224355/grok-tokens/main/install.
 
 That downloads the latest GitHub Release binary (`grok-tokens-<target>.tar.gz`) into `~/.local/bin/grok-tokens`. No Rust toolchain required.
 
-Override repo:
+Override repo (env vars must be on the `bash` side of the pipe):
 
 ```bash
-GROK_TOKENS_REPO=yourname/grok-tokens \
-  curl -fsSL https://raw.githubusercontent.com/yourname/grok-tokens/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/yourname/grok-tokens/main/install.sh \
+  | GROK_TOKENS_REPO=yourname/grok-tokens bash
 ```
 
 ```bash
