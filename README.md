@@ -27,7 +27,7 @@ Before the package is on npmjs, install from GitHub (same `postinstall`, picks t
 npm install -g github:aja224355/grok-tokens
 ```
 
-`postinstall` detects `win32` / `linux` / `darwin` + `x64` / `arm64` and downloads `grok-tokens-<target>.tar.gz`. Pin a tag with `GROK_TOKENS_TAG=v0.1.1`.
+`postinstall` detects `win32` / `linux` / `darwin` + `x64` / `arm64` and downloads `grok-tokens-<target>.tar.gz`. Pin a tag with `GROK_TOKENS_TAG=v0.1.2`.
 
 **Linux / macOS / WSL (curl):**
 
@@ -207,8 +207,8 @@ A `turn_completed` row sums every API request in the turn, so API$ cannot place 
 
 ```bash
 # bump version in Cargo.toml and package.json
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 # Actions builds linux/mac/windows tarballs and attaches install.sh + install.ps1
 npm publish --access public   # optional; needs npm login
 ```

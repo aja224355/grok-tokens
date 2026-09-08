@@ -11,7 +11,7 @@ const PKG = (() => {
   try {
     return JSON.parse(fs.readFileSync(path.join(PKG_DIR, "package.json"), "utf8"));
   } catch {
-    return { version: "0.1.0" };
+    return { version: "0.1.2" };
   }
 })();
 
