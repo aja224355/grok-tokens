@@ -13,3 +13,5 @@ target/
 .DS_Store
 /grok-tokens
 *.tar.gz
+node_modules/
+npm/vendor/
