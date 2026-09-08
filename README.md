@@ -9,11 +9,27 @@ Inspired by the install UX of [grok-usage](https://github.com/simnova/grok-usage
 
 ---
 
-## Install (other computers)
+## Install
 
-No Rust, no git clone. The installer downloads a native binary from GitHub Releases.
+No Rust, no git clone. Installers download a native binary from GitHub Releases.
 
-**Linux / macOS / WSL:**
+**npm** (Win11 / Linux / macOS — if Node is already installed):
+
+```bash
+npm install -g grok-tokens
+grok-tokens --version
+grok-tokens daily
+```
+
+Before the package is on npmjs, install from GitHub (same `postinstall`, picks the matching Release binary):
+
+```bash
+npm install -g github:aja224355/grok-tokens
+```
+
+`postinstall` detects `win32` / `linux` / `darwin` + `x64` / `arm64` and downloads `grok-tokens-<target>.tar.gz`. Pin a tag with `GROK_TOKENS_TAG=v0.1.2`.
+
+**Linux / macOS / WSL (curl):**
 
 ```bash
 curl -fsSL https://github.com/aja224355/grok-tokens/releases/latest/download/install.sh | sh
@@ -48,11 +64,12 @@ curl -fsSL https://github.com/aja224355/grok-tokens/releases/latest/download/ins
 
 ### What the installer does
 
-1. **`curl | sh` / `irm | iex`** → GitHub Release asset for this OS/arch  
+1. **`npm install -g`** → `postinstall` downloads the matching GitHub Release tarball  
+2. **`curl | sh` / `irm | iex`** → GitHub Release asset for this OS/arch  
    - Linux: **`x86_64-unknown-linux-musl`** / `aarch64-unknown-linux-musl` (gnu fallback)
    - macOS: `aarch64-apple-darwin` / `x86_64-apple-darwin`
    - Windows: `x86_64-pc-windows-msvc`
-2. **`./install.sh` in a clone** → `cargo build --release` (or existing `target/release`)
+3. **`./install.sh` in a clone** → `cargo build --release` (or existing `target/release`)
 
 Force a Release download from a clone: `GROK_TOKENS_FORCE_DOWNLOAD=1 ./install.sh`
 
@@ -131,7 +148,7 @@ grok-tokens account export -o /mnt/c/Users/YOU/grok-account.json
 GROK_HOME="/mnt/c/Users/YOU/.grok" grok-tokens account import /mnt/c/Users/YOU/grok-account.json
 ```
 
-Or copy the file to Windows and import with the native binary:
+Or copy the file to Windows and import with the native binary (`npm install -g grok-tokens` or `install.ps1`):
 
 ```powershell
 grok-tokens account import $env:USERPROFILE\grok-account.json
@@ -148,7 +165,7 @@ Grok CLI on that side picks up `auth.json` on the next API call. Refresh tokens 
 | `--root DIR` | Sessions root override |
 | `--json` | Machine-readable |
 | `--usage-only` | Hide empty sessions |
-| `-v` | Log$ + cache Saved$ |
+| `-v` | daily: cache Saved$ · session: project path |
 | `--no-color` | Disable colors |
 
 Data: `$GROK_DATA_DIR` → `$GROK_HOME/sessions` → `~/.grok/sessions`.
@@ -166,16 +183,17 @@ Data: `$GROK_DATA_DIR` → `$GROK_HOME/sessions` → `~/.grok/sessions`.
 | **Output** | Σ `outputTokens` |
 | **Total** | ≈ Input + Output |
 | **NoCache** | Fresh + Output |
-| **Cost** | Public list price + cache discount + long-context tier |
-| **Log$** (`-v`) | `costUsdTicks/1e9` (CLI internal) |
-| **Saved** (`-v`) | vs full-price input |
+| **Billing** | `costUsdTicks / 1e10` — CLI / SuperGrok receipt |
+| **API$** | Public list price on that row's token totals (200k 2× only when `modelCalls ≤ 1`) |
+| **Saved** (`-v`) | API$ vs billing all input at the full input rate |
 
 ```text
-fresh = input - cachedRead
-Cost  = fresh×input_rate + cached×cached_rate + output×output_rate
+fresh    = input - cachedRead
+Billing  = costUsdTicks / 1e10
+API$     = fresh×input_rate + cached×cached_rate + output×output_rate
 ```
 
-Rates follow [xAI pricing](https://docs.x.ai/developers/pricing) for grok-4.5 (and friends). Estimates only.
+A `turn_completed` row sums every API request in the turn, so API$ cannot place the 200k cliff per request. Rates follow [xAI pricing](https://docs.x.ai/developers/pricing).
 
 ---
 
@@ -188,10 +206,11 @@ Rates follow [xAI pricing](https://docs.x.ai/developers/pricing) for grok-4.5 (a
 ## Publish (maintainers)
 
 ```bash
-# bump version in Cargo.toml
-git tag v0.1.1
-git push origin v0.1.1
+# bump version in Cargo.toml and package.json
+git tag v0.1.2
+git push origin v0.1.2
 # Actions builds linux/mac/windows tarballs and attaches install.sh + install.ps1
+npm publish --access public   # optional; needs npm login
 ```
 
 ---
@@ -203,12 +222,14 @@ cargo run -- daily --no-color
 cargo run -- session --usage-only
 cargo build --release
 ./install.sh
+npm run test:npm
 ```
 
 ```text
 src/main.rs           # Rust CLI
 install.sh            # Unix installer (curl | sh)
 install.ps1           # Windows installer (irm | iex)
+npm/                  # npm wrapper (downloads the matching Release binary)
 .github/workflows/    # CI + multi-target release
 grok_tokens.py        # deprecated; do not extend
 ```

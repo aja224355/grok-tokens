@@ -1,0 +1,32 @@
+{
+  "name": "grok-tokens",
+  "version": "0.1.2",
+  "description": "Count real Grok Build usage tokens from local session logs",
+  "license": "MIT",
+  "bin": {
+    "grok-tokens": "npm/cli.js"
+  },
+  "scripts": {
+    "postinstall": "node npm/install.js",
+    "test:npm": "node --check npm/lib.js && node --check npm/install.js && node --check npm/cli.js && node npm/lib.js"
+  },
+  "files": [
+    "npm/cli.js",
+    "npm/install.js",
+    "npm/lib.js"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": ["darwin", "linux", "win32"],
+  "cpu": ["x64", "arm64"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aja224355/grok-tokens.git"
+  },
+  "bugs": {
+    "url": "https://github.com/aja224355/grok-tokens/issues"
+  },
+  "homepage": "https://github.com/aja224355/grok-tokens#readme",
+  "keywords": ["grok", "xai", "tokens", "cli", "usage"]
+}
